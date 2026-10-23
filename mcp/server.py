@@ -115,6 +115,15 @@ def gpu_submit(local_dir: str, commands: list[str]) -> dict:
     gets all the runner's GPUs (CUDA_VISIBLE_DEVICES is set). Write results to files in the
     job directory (e.g. out/) — that is how they can be read back with gpu_output.
 
+    Jobs get a clean interpreter environment: the daemon's own virtualenv is stripped from
+    VIRTUAL_ENV and PATH, so a bare `python` is the system interpreter and `uv` has no venv to
+    fall back to. Create your own and address it explicitly, or nothing gets installed where
+    you expect:
+
+        uv venv
+        uv pip install --python .venv/bin/python numpy
+        .venv/bin/python script.py
+
     There is no cancel and no time limit, so make sure the job terminates.
 
     Args:

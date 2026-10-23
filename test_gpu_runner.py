@@ -468,6 +468,26 @@ class TestEnvironment:
         out = daemon.out(jid)[0]
         assert out.startswith("yes /") and "python3" in out
 
+    def test_daemon_venv_not_leaked_into_job(self, daemon, monkeypatch):
+        """A job must not see the daemon's venv: uv and a bare python would silently use it."""
+        monkeypatch.setenv("VIRTUAL_ENV", "/opt/daemon-venv")
+        monkeypatch.setenv("VIRTUAL_ENV_PROMPT", "daemon")
+        monkeypatch.setenv("PATH", "/opt/daemon-venv/bin:" + os.environ["PATH"])
+        jid = daemon.submit(['echo "[$VIRTUAL_ENV][$VIRTUAL_ENV_PROMPT][$PATH]"'])
+        daemon.wait(jid)
+        out = daemon.out(jid)[0]
+        assert out.startswith("[][][") and "/opt/daemon-venv" not in out
+
+    def test_job_env_strips_venv_keeps_rest(self, monkeypatch):
+        monkeypatch.setenv("VIRTUAL_ENV", "/opt/daemon-venv/")  # trailing slash must not matter
+        monkeypatch.setenv("VIRTUAL_ENV_PROMPT", "daemon")
+        monkeypatch.setenv("PATH", "/opt/daemon-venv/bin:/usr/bin")
+        env = gpu_runner.job_env([2, 3])
+        assert "VIRTUAL_ENV" not in env and "VIRTUAL_ENV_PROMPT" not in env
+        assert env["PATH"] == "/usr/bin"
+        assert env["CUDA_VISIBLE_DEVICES"] == "2,3"
+        assert env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+
     def test_cvd_not_leaked_into_daemon(self, daemon):
         before = os.environ.get("CUDA_VISIBLE_DEVICES")
         daemon.wait(daemon.submit(["true"]))

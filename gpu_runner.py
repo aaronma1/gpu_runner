@@ -34,6 +34,27 @@ PORT = int(os.environ.get("GPU_RUNNER_PORT", 18861))
 TERMINAL = {"COMPLETED", "FAILED"}
 
 
+def job_env(gpus):
+    """The environment a job's commands run in: the daemon's, minus the daemon's own venv.
+
+    The daemon is normally started from an activated virtualenv, so VIRTUAL_ENV and that venv's
+    bin (first on PATH) would otherwise leak into every job. Tools that resolve the environment
+    themselves then pick the wrong one: `uv pip install` installs into the daemon's venv instead
+    of the job's ./.venv and still exits 0, and a bare `python` runs the daemon's interpreter.
+    Both fail confusingly much later, so strip the venv and let jobs use their own.
+    """
+    env = dict(os.environ)  # keep PATH, HOME, ...; only override the GPU selection
+    venv = env.pop("VIRTUAL_ENV", None)
+    env.pop("VIRTUAL_ENV_PROMPT", None)
+    if venv:
+        venv_bin = os.path.join(os.path.realpath(venv), "bin")
+        env["PATH"] = os.pathsep.join(p for p in env.get("PATH", "").split(os.pathsep)
+                                      if p and os.path.realpath(p) != venv_bin)
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # so indices match nvidia-smi
+    return env
+
+
 class Daemon(rpyc.Service):
 
     def __init__(self, workdir, gpus=None, poll=1.0, verbose=False):
@@ -73,9 +94,7 @@ class Daemon(rpyc.Service):
         daemon can always move on to the next job."""
         try:
             self._setup_job(job)
-            env = dict(os.environ)  # keep PATH, HOME, ...; only override the GPU selection
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpus))
-            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # so indices match nvidia-smi
+            env = job_env(self.gpus)
             for command in job.commands:
                 # Output goes to files, not pipes: with pipes, a background child that inherits
                 # them keeps the job "running" until it exits. stdin is /dev/null so a command
