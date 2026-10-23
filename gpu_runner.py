@@ -36,7 +36,7 @@ TERMINAL = {"COMPLETED", "FAILED"}
 
 class Daemon(rpyc.Service):
 
-    def __init__(self, workdir, gpus=None, poll=1.0):
+    def __init__(self, workdir, gpus=None, poll=1.0, verbose=False):
         self.workdir = workdir
         self.gpus = list(gpus or [])
         self.poll = poll
@@ -47,9 +47,13 @@ class Daemon(rpyc.Service):
         self.ready = []              # queued jobs, FIFO            (mutex protected)
         self.running = None          # the one running job, or None (mutex protected)
 
+        self.verbose = verbose
+
     # ------------------------------------------------------------ job execution
     def _setup_job(self, job):
         """Create the job's directory and extract its tarball into it (safely)."""
+        if self.verbose:
+            print(f"[gpu_runner] setting up job {job.job_uuid} in {job.workdir}", flush=True)
         os.makedirs(job.workdir)
         if job.tarfile:
             with tarfile.open(fileobj=io.BytesIO(job.tarfile), mode="r:*") as tar:
@@ -144,6 +148,8 @@ class Daemon(rpyc.Service):
     def exposed_receive_job(self, message_id, tarfile_bytes, commands):
         # rpyc passes str/bytes by value but lists by reference (a proxy to the client's list,
         # dead once the client disconnects), so copy everything into local objects now.
+        if self.verbose:
+            print(f"[gpu_runner] received job with message_id {message_id} and commands {commands}", flush=True)
         message_id = str(message_id)
         commands = [str(c) for c in commands]
         tarfile_bytes = bytes(tarfile_bytes) if tarfile_bytes else None
@@ -250,7 +256,10 @@ def main():
     parser_daemon = subparsers.add_parser("daemon", help="Start the GPU daemon.")
     parser_daemon.add_argument("--gpu", type=int, nargs="+", default=[0],
                                help="GPU indices every job gets (default: 0).")
+                            
+    parser_daemon.add_argument("--cpu", action="store_true", help="CPU indices every job gets (default: 0).")
     parser_daemon.add_argument("--workdir", default=DAEMON_WORKDIR)
+    parser_daemon.add_argument("--verbose", action="store_true", help="Print verbose output.")
 
     parser_submit = subparsers.add_parser("submit", help="Submit a job; prints its UUID.")
     parser_submit.add_argument("tarfile", help="Tarball of the job's working directory, '-' for stdin, "
@@ -274,11 +283,11 @@ def main():
 
     if args.command == "daemon":
         os.makedirs(args.workdir, exist_ok=True)
-        daemon = Daemon(args.workdir, args.gpu)
+        daemon = Daemon(args.workdir, [] if args.cpu else args.gpu, verbose=args.verbose)
         server = rpyc.ThreadedServer(daemon, hostname="localhost", port=PORT,  # NOT 0.0.0.0
                                      protocol_config={"sync_request_timeout": 600})
         threading.Thread(target=server.start, daemon=True).start()
-        print(f"GPU daemon on localhost:{PORT}, gpus={args.gpu}, workdir={args.workdir}", flush=True)
+        print(f"GPU daemon on localhost:{PORT}, gpus={[] if args.cpu else args.gpu}, workdir={args.workdir}", flush=True)
         try:
             daemon._loop()
         except:

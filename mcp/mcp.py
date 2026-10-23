@@ -18,7 +18,7 @@ import tarfile
 import time
 import uuid
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 # ---------------------------------------------------------------- hardcoded for now
 GPURUN = "/home/a84456917/Projects/gpu_runner/gpu_runner.py"
@@ -32,7 +32,7 @@ EXCLUDE_DIRS = {".git", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_
 MAX_UPLOAD_MB = 500
 SUBMIT_RETRIES = 3
 
-mcp = FastMCP("gpu_runner")
+mcp = MCPServer("gpu_runner")
 
 
 class RunnerError(RuntimeError):
