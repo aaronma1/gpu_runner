@@ -106,12 +106,27 @@ def tail(text, lines):
 # ---------------------------------------------------------------- tools
 @mcp.tool()
 def gpu_submit(local_dir: str, commands: list[str]) -> dict:
-    """Queue a job on the GPU box. Uploads local_dir (minus .git/.venv/caches, max 500 MB) and
-    runs `commands` in it, in order, as shell commands; the first failing command stops the job.
-    Jobs run one at a time and each gets all the runner's GPUs (CUDA_VISIBLE_DEVICES is set).
-    Commands get no stdin. Write results to files in the job directory (e.g. out/).
+    """Queue a job on the GPU box: upload a directory, then run shell commands in it.
+
+    Uploads `local_dir` as a gzipped tarball (excluding .git/.venv/caches, max 500 MB) and
+    runs each string in `commands` in order, as a shell command, inside that directory.
+    The first command that exits non-zero stops the job and it is marked FAILED; the
+    remaining commands do not run. Commands get no stdin. Jobs run one at a time and each
+    gets all the runner's GPUs (CUDA_VISIBLE_DEVICES is set). Write results to files in the
+    job directory (e.g. out/) — that is how they can be read back with gpu_output.
+
     There is no cancel and no time limit, so make sure the job terminates.
-    Returns the job_uuid. Safe to call once per job: transport retries reuse one message_id."""
+
+    Args:
+        local_dir: local directory to upload as the job's working tree.
+        commands: non-empty list of shell commands, run in order.
+
+    Returns:
+        {"job_uuid": str, "job_dir": str} on success, or {"error": str} on failure.
+
+    Note: idempotent per call — transport retries reuse one message_id, so a retried submit
+    returns the same job rather than queueing a duplicate.
+    """
     if not commands:
         return {"error": "commands must be a non-empty list"}
     try:
@@ -136,8 +151,18 @@ def gpu_submit(local_dir: str, commands: list[str]) -> dict:
 
 @mcp.tool()
 def gpu_status(job_uuid: str) -> dict:
-    """Status of one job: QUEUED, RUNNING, COMPLETED or FAILED, its exit code, the command that
-    failed (if any) and job_dir, the job's working directory on the GPU box."""
+    """Report one job's current state.
+
+    Args:
+        job_uuid: the job's uuid (from gpu_submit or gpu_list).
+
+    Returns:
+        {"status": "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED",
+        "exit_code": int | None,          # exit code of the last command; None until done
+        "failed_command": str | None,     # the failing command when FAILED, else None
+        "job_uuid": str, "job_dir": str}
+        or {"error": str} (e.g. unknown job) on failure.
+    """
     try:
         return get_status(job_uuid)
     except RunnerError as e:
@@ -146,8 +171,15 @@ def gpu_status(job_uuid: str) -> dict:
 
 @mcp.tool()
 def gpu_output(job_uuid: str, tail_lines: int = 200) -> dict:
-    """stdout and stderr of a job (so far, if it is still running): the last `tail_lines` lines
-    of each (0 = everything)."""
+    """Return a job's stdout and stderr so far. Works while the job is still running.
+
+    Args:
+        job_uuid: the job's uuid.
+        tail_lines: return only the last N lines of each stream; 0 returns everything.
+
+    Returns:
+        {"stdout": str, "stderr": str}, or {"error": str} on failure.
+    """
     try:
         out, err = run_cli(["query", job_uuid, "--stdout", "--stderr"], timeout=120)
         return {"stdout": tail(out, tail_lines), "stderr": tail(err, tail_lines)}
@@ -175,7 +207,14 @@ def gpu_wait(job_uuid: str, max_wait_s: int = 600, poll_s: int = 10) -> dict:
 
 @mcp.tool()
 def gpu_list() -> str:
-    """All jobs the daemon knows (since it last started): uuid, status, first command."""
+    """List every job the daemon knows about since it last started.
+
+    Returns:
+        Text, one line per job: "<job_uuid>  <status>  <first command>".
+        "(no jobs)" when the queue is empty, or "error: <message>" on failure.
+
+    Job state is held in memory, so restarting the daemon forgets all jobs.
+    """
     try:
         out, _ = run_cli(["list"], timeout=60)
         return out or "(no jobs)"
