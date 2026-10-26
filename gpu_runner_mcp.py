@@ -16,7 +16,6 @@ import tempfile
 import time
 import uuid
 
-
 from mcp.server.mcpserver import MCPServer as MCP
 
 # ---------------------------------------------------------------- hardcoded for now (env overrides)
@@ -237,8 +236,11 @@ def download_job_files(job_uuid: str, files: dict[str, str], overwrite: bool = T
             return {"error": f"local destination must be an absolute path: {dest!r}"}
         targets[job_path] = dest
     try:
-        status = get_status(job_uuid)
+        # Status before the download decides completeness (a job that was already finished can't
+        # change its files mid-download); status after is what we report.
+        before = get_status(job_uuid)["status"]
         data, _ = run_cli(["download", job_uuid, "--", *targets], binary=True, timeout=1800)
+        status = get_status(job_uuid)
         placed = {}
         with tempfile.TemporaryDirectory(prefix="gpu_runner_dl_") as tmp:
             _safe_extract(data, tmp)
@@ -250,8 +252,8 @@ def download_job_files(job_uuid: str, files: dict[str, str], overwrite: bool = T
     except (RunnerError, OSError, tarfile.TarError) as e:
         return {"error": str(e)}
     result = {"downloaded": placed, "bytes": len(data), "job_status": status["status"]}
-    if status["status"] not in TERMINAL:
-        result["warning"] = "job is still running; files may be incomplete"
+    if before not in TERMINAL:
+        result["warning"] = "job was still running during the download; files may be incomplete"
     return result
 
 

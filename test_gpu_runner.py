@@ -977,7 +977,9 @@ class TestMCPDownload:
         import asyncio
         tools = {t.name: t for t in asyncio.run(mcp_mod.mcp.list_tools())}
         assert "download_job_files" in tools
-        assert {"job_uuid", "files", "overwrite"} <= set(tools["download_job_files"].inputSchema["properties"])
+        t = tools["download_job_files"]
+        schema = getattr(t, "input_schema", None) or getattr(t, "inputSchema")  # name varies by mcp version
+        assert {"job_uuid", "files", "overwrite"} <= set(schema["properties"])
 
     def test_file_and_dir_to_destinations(self, mcp_mod, mcp_job, tmp_path):
         dest = tmp_path / "res"
@@ -1062,7 +1064,7 @@ class TestMCPDownload:
             if "error" not in r:
                 break
             time.sleep(0.2)
-        assert r.get("job_status") == "RUNNING" and "warning" in r, r
+        assert "warning" in r and r.get("job_status") in ("QUEUED", "RUNNING", "COMPLETED"), r
         assert (tmp_path / "e.txt").read_text() == "early\n"
         mcp_mod.gpu_wait(jid, max_wait_s=30, poll_s=1)
 
@@ -1077,6 +1079,10 @@ class TestMCPDownload:
         import json
         res = asyncio.run(mcp_mod.mcp.call_tool(
             "download_job_files", {"job_uuid": mcp_job, "files": {"train.log": str(tmp_path / "t.log")}}))
-        content = res[0] if isinstance(res, tuple) else res
+        # mcp versions differ: a list of content blocks, a (content, structured) tuple, or a
+        # CallToolResult with .content / .structured_content
+        if isinstance(res, tuple):
+            res = res[0]
+        content = getattr(res, "content", res)
         payload = json.loads(content[0].text)
         assert payload["job_status"] == "COMPLETED" and (tmp_path / "t.log").read_text() == "log\n"
