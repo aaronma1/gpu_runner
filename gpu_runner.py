@@ -35,6 +35,9 @@ import uuid
 import rpyc
 
 DAEMON_WORKDIR = os.path.expanduser(os.environ.get("GPU_RUNNER_WORKDIR", "~/data/.gpu_runner"))
+JOB_UV_CACHE = os.path.expanduser(os.environ.get("GPU_RUNNER_JOB_UV_CACHE", "~/data/.cache/gpu_runner/uv"))
+JOB_CACHE = os.path.expanduser(os.environ.get("GPU_RUNNER_JOB_CACHE", "~/data/.cache/gpu_runner"))
+
 PORT = int(os.environ.get("GPU_RUNNER_PORT", 18861))
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 MAX_DOWNLOAD_BYTES = 512  * 1024 * 1024 # 1 TB, arbitrary limit to avoid memory exhaustion
