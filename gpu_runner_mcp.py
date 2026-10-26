@@ -23,7 +23,7 @@ GPURUN = os.environ.get("GPU_RUNNER_MCP_GPURUN", "/home/a84456917/Projects/gpu_r
 PYTHON = os.environ.get("GPU_RUNNER_MCP_PYTHON",
                         "/home/a84456917/Projects/gpu_runner/.venv/bin/python")  # env with rpyc
 DAEMON_WORKDIR = os.environ.get("GPU_RUNNER_MCP_WORKDIR", "/home/a84456917/.gpu_runner")
-SSH_HOST = os.environ.get("GPU_RUNNER_MCP_SSH_HOST") or None  # e.g. "gpu" to go over ssh
+SSH_HOST = os.environ.get("GPU_RUNNER_MCP_SSH_HOST") or "gpu"  # e.g. "gpu" to go over ssh
 
 TERMINAL = {"COMPLETED", "FAILED"}
 EXCLUDE_DIRS = {".git", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
