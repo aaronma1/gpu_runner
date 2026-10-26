@@ -1064,7 +1064,9 @@ class TestMCPDownload:
             if "error" not in r:
                 break
             time.sleep(0.2)
-        assert "warning" in r and r.get("job_status") in ("QUEUED", "RUNNING", "COMPLETED"), r
+        # status is read after the download, so the job has at least started; it's usually still
+        # in its `sleep 3`, but a slow machine may have finished it
+        assert "warning" in r and r.get("job_status") in ("RUNNING", "COMPLETED"), r
         assert (tmp_path / "e.txt").read_text() == "early\n"
         mcp_mod.gpu_wait(jid, max_wait_s=30, poll_s=1)
 
