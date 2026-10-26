@@ -7,7 +7,8 @@
 Layers:
   * Daemon        — the Daemon class in-process: exposed_* called directly, _loop in a thread.
   * RPC           — a real `gpu_runner.py daemon` subprocess, driven with rpyc.connect.
-  * CLI           — the same daemon, driven with `gpu_runner.py submit/query/list`.
+  * CLI           — the same daemon, driven with `gpu_runner.py submit/query/download/list`.
+  * MCP           — gpu_runner_mcp.py tools against the same daemon (skipped without `mcp`).
 No GPU is needed; GPU ids are only checked as CUDA_VISIBLE_DEVICES.
 """
 import io
@@ -725,3 +726,357 @@ class TestDaemonProcess:
             rpc_wait(conn, jid, timeout=60)
         elapsed = time.time() - t0
         assert elapsed < 30, f"10 trivial jobs took {elapsed:.1f}s"
+
+# ====================================================================== downloads
+def untar(data):
+    """{name: bytes} for regular files in a tar.gz, plus {name: linkname} for symlinks."""
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
+        members = t.getmembers()
+        files = {os.path.normpath(m.name): t.extractfile(m).read() for m in members if m.isfile()}
+        links = {os.path.normpath(m.name): m.linkname for m in members if m.issym() or m.islnk()}
+    return files, links
+
+
+RESULTS_CMD = ("mkdir -p out/plots && echo '{\"acc\": 0.9}' > out/metrics.json && "
+               "echo png > out/plots/a.png && echo log > train.log")
+
+
+class TestDownload:
+    @pytest.fixture
+    def done_job(self, daemon):
+        jid = daemon.submit([RESULTS_CMD])
+        assert daemon.wait(jid)[0] == "COMPLETED"
+        return jid
+
+    def dl(self, daemon, jid, files):
+        return untar(daemon.exposed_download_job_files(jid, files))[0]
+
+    def test_single_file(self, daemon, done_job):
+        assert self.dl(daemon, done_job, ["out/metrics.json"]) == {"out/metrics.json": b'{"acc": 0.9}\n'}
+
+    def test_directory_is_recursive(self, daemon, done_job):
+        assert set(self.dl(daemon, done_job, ["out"])) == {"out/metrics.json", "out/plots/a.png"}
+
+    def test_several_paths(self, daemon, done_job):
+        assert set(self.dl(daemon, done_job, ["train.log", "out/plots"])) == {"train.log", "out/plots/a.png"}
+
+    def test_dot_is_everything(self, daemon, done_job):
+        assert set(self.dl(daemon, done_job, ["."])) == {"train.log", "out/metrics.json", "out/plots/a.png"}
+
+    def test_stdout_stderr_files_not_included(self, daemon, done_job):
+        # they live next to the job dir, not in it
+        assert not any(n.endswith((".stdout", ".stderr")) for n in self.dl(daemon, done_job, ["."]))
+
+    def test_names_are_normalized(self, daemon, done_job):
+        assert set(self.dl(daemon, done_job, ["./out/../out/metrics.json"])) == {"out/metrics.json"}
+
+    def test_overlapping_requests_ok(self, daemon, done_job):
+        assert set(self.dl(daemon, done_job, ["out", "out/metrics.json"])) == {"out/metrics.json", "out/plots/a.png"}
+
+    def test_binary_content_exact(self, daemon):
+        jid = daemon.submit(["head -c 100000 /dev/urandom > r.bin && sha256sum r.bin | cut -c1-64 > r.sha"])
+        daemon.wait(jid)
+        files = self.dl(daemon, jid, ["r.bin", "r.sha"])
+        import hashlib
+        assert hashlib.sha256(files["r.bin"]).hexdigest() == files["r.sha"].decode().strip()
+
+    def test_empty_file_and_empty_dir(self, daemon):
+        jid = daemon.submit(["mkdir empty && touch zero.txt"])
+        daemon.wait(jid)
+        with tarfile.open(fileobj=io.BytesIO(daemon.exposed_download_job_files(jid, ["empty", "zero.txt"]))) as t:
+            kinds = {os.path.normpath(m.name): (m.isdir(), m.size) for m in t.getmembers()}
+        assert kinds == {"empty": (True, 0), "zero.txt": (False, 0)}
+
+    def test_returns_gzip_bytes(self, daemon, done_job):
+        data = daemon.exposed_download_job_files(done_job, ["train.log"])
+        assert isinstance(data, bytes) and data[:2] == b"\x1f\x8b"
+
+    def test_missing_files_all_listed(self, daemon, done_job):
+        with pytest.raises(FileNotFoundError) as e:
+            daemon.exposed_download_job_files(done_job, ["train.log", "nope.txt", "out/nope"])
+        assert "nope.txt" in str(e.value) and "out/nope" in str(e.value) and "train.log" not in str(e.value)
+
+    @pytest.mark.parametrize("path", ["/etc/passwd", "../x", "out/../../x", "..", "../" + "a" * 8])
+    def test_paths_outside_job_rejected(self, daemon, done_job, path):
+        with pytest.raises(ValueError):
+            daemon.exposed_download_job_files(done_job, [path])
+
+    def test_sibling_job_not_reachable(self, daemon, done_job):
+        other = daemon.submit(["echo secret > s.txt"])
+        daemon.wait(other)
+        with pytest.raises(ValueError):
+            daemon.exposed_download_job_files(done_job, [f"../{other}/s.txt"])
+
+    def test_requested_symlink_escaping_rejected(self, daemon):
+        jid = daemon.submit(["ln -s /etc escape && ln -s \"$HOME\" home && ln -s ../ up"])
+        daemon.wait(jid)
+        for p in ("escape/passwd", "escape", "home", "up"):
+            with pytest.raises(ValueError):
+                daemon.exposed_download_job_files(jid, [p])
+
+    def test_requested_symlink_inside_is_followed(self, daemon):
+        jid = daemon.submit(["echo real > real.txt && ln -s real.txt link.txt"])
+        daemon.wait(jid)
+        assert self.dl(daemon, jid, ["link.txt"]) == {"link.txt": b"real\n"}
+
+    def test_escaping_symlink_inside_dir_dropped(self, daemon):
+        jid = daemon.submit(["mkdir -p out && echo ok > out/ok.txt && ln -s /etc/passwd out/pw "
+                             "&& ln -s ../../ out/up && ln -s ok.txt out/good"])
+        daemon.wait(jid)
+        files, links = untar(daemon.exposed_download_job_files(jid, ["out"]))
+        assert files == {"out/ok.txt": b"ok\n"}
+        assert links == {"out/good": "ok.txt"}  # the inside link is kept as a link
+
+    def test_queued_job_has_no_directory(self, daemon):
+        blocker = daemon.submit(["sleep 1"])
+        queued = daemon.submit(["true"])
+        with pytest.raises(FileNotFoundError, match="no directory yet"):
+            daemon.exposed_download_job_files(queued, ["."])
+        daemon.wait(blocker)
+        daemon.wait(queued)
+
+    def test_running_job_partial_download(self, daemon):
+        jid = daemon.submit(["echo partial > p.txt; sleep 3"])
+        deadline = time.time() + 10
+        while not os.path.exists(os.path.join(daemon.workdir, jid, "p.txt")) and time.time() < deadline:
+            time.sleep(0.05)
+        assert daemon.status(jid)[0] == "RUNNING"
+        assert self.dl(daemon, jid, ["p.txt"]) == {"p.txt": b"partial\n"}
+        daemon.wait(jid)
+
+    def test_failed_job_still_downloadable(self, daemon):
+        jid = daemon.submit(["echo crash-log > crash.txt; exit 1"])
+        assert daemon.wait(jid)[0] == "FAILED"
+        assert self.dl(daemon, jid, ["crash.txt"]) == {"crash.txt": b"crash-log\n"}
+
+    def test_size_limit(self, daemon, monkeypatch):
+        monkeypatch.setattr(gpu_runner, "MAX_DOWNLOAD_BYTES", 1024)
+        jid = daemon.submit(["mkdir d && head -c 600 /dev/zero > d/a && head -c 600 /dev/zero > d/b"])
+        daemon.wait(jid)
+        assert self.dl(daemon, jid, ["d/a"])  # one file fits
+        with pytest.raises(ValueError, match="download limit"):
+            daemon.exposed_download_job_files(jid, ["d"])  # the directory total does not
+
+    def test_size_limit_ignores_symlink_targets(self, daemon, monkeypatch):
+        monkeypatch.setattr(gpu_runner, "MAX_DOWNLOAD_BYTES", 1024)
+        jid = daemon.submit(["mkdir d && head -c 900 /dev/zero > d/a && ln -s a d/b"])
+        daemon.wait(jid)
+        assert "d/a" in self.dl(daemon, jid, ["d"])
+
+    def test_unknown_job_and_bad_requests(self, daemon, done_job):
+        with pytest.raises(KeyError):
+            daemon.exposed_download_job_files(str(uuid.uuid4()), ["."])
+        with pytest.raises(ValueError):
+            daemon.exposed_download_job_files(done_job, [])
+
+    def test_inputs_copied_and_coerced(self, daemon, done_job):
+        files = ["train.log"]
+        data = daemon.exposed_download_job_files(done_job, tuple(files))
+        assert untar(data)[0] == {"train.log": b"log\n"}
+
+    def test_does_not_block_job_loop(self, daemon):
+        jid = daemon.submit(["head -c 30000000 /dev/urandom > blob.bin"])
+        daemon.wait(jid, timeout=60)
+        result = {}
+        t = threading.Thread(target=lambda: result.update(d=daemon.exposed_download_job_files(jid, ["blob.bin"])))
+        t.start()
+        time.sleep(0.05)
+        quick = daemon.submit(["echo quick"])  # must get scheduled while the tar is being built
+        assert daemon.wait(quick, timeout=30)[0] == "COMPLETED"
+        t.join(timeout=120)
+        assert len(result["d"]) > 30_000_000 * 0.9
+
+    # ---- rpyc (real daemon)
+    def test_rpc_returns_bytes_by_value(self, conn):
+        jid = rpc_submit(conn, ["echo rpc-dl > r.txt"])
+        rpc_wait(conn, jid)
+        data = conn.root.download_job_files(jid, ["r.txt"])
+        conn.close()
+        assert isinstance(data, bytes) and untar(data)[0] == {"r.txt": b"rpc-dl\n"}
+
+    def test_rpc_errors_keep_type(self, conn):
+        jid = rpc_submit(conn, ["true"])
+        rpc_wait(conn, jid)
+        with pytest.raises(FileNotFoundError):
+            conn.root.download_job_files(jid, ["missing.txt"])
+        with pytest.raises(ValueError):
+            conn.root.download_job_files(jid, ["../x"])
+        with pytest.raises(KeyError):
+            conn.root.download_job_files(str(uuid.uuid4()), ["."])
+
+    def test_rpc_list_arg_survives(self, server):
+        # the files list arrives as a netref; the daemon must copy it before the client goes away
+        c = rpyc.connect("localhost", server["port"])
+        jid = rpc_submit(c, ["echo a > a.txt"])
+        rpc_wait(c, jid)
+        assert untar(c.root.download_job_files(jid, ["a.txt"]))[0] == {"a.txt": b"a\n"}
+        c.close()
+
+    # ---- CLI
+    def test_cli_to_stdout_and_file(self, server, tmp_path):
+        jid = cli(server, "submit", "", "mkdir out && echo cli-dl > out/c.txt").stdout.decode().strip()
+        cli(server, "query", jid, "--wait")
+        p = cli(server, "download", jid, "out")
+        assert p.returncode == 0 and untar(p.stdout)[0] == {"out/c.txt": b"cli-dl\n"}
+        target = tmp_path / "res.tar.gz"
+        assert cli(server, "download", jid, "out/c.txt", "-o", str(target)).returncode == 0
+        assert untar(target.read_bytes())[0] == {"out/c.txt": b"cli-dl\n"}
+
+    def test_cli_double_dash_allows_dash_names(self, server):
+        jid = cli(server, "submit", "", "echo dashed > ./-weird.txt").stdout.decode().strip()
+        cli(server, "query", jid, "--wait")
+        p = cli(server, "download", jid, "--", "-weird.txt")
+        assert p.returncode == 0 and untar(p.stdout)[0] == {"-weird.txt": b"dashed\n"}
+
+    def test_cli_errors_are_clean(self, server, tmp_path):
+        jid = cli(server, "submit", "", "true").stdout.decode().strip()
+        cli(server, "query", jid, "--wait")
+        cases = [(["download", jid, "missing.txt"], b"not found"),
+                 (["download", jid, "../x"], b"not a path inside"),
+                 (["download", str(uuid.uuid4()), "."], b"no such job"),
+                 (["download", jid, ".", "-o", str(tmp_path / "no" / "dir" / "x.tgz")], b"cannot write")]
+        for args, needle in cases:
+            p = cli(server, *args)
+            assert p.returncode != 0 and needle in p.stderr and b"Traceback" not in p.stderr, (args, p.stderr)
+
+    def test_cli_requires_a_path(self, server):
+        assert cli(server, "download", str(uuid.uuid4())).returncode == 2
+
+    def test_cli_no_daemon(self, server):
+        env = dict(server["env"], GPU_RUNNER_PORT=str(free_port()))
+        p = subprocess.run(RUNNER + ["download", str(uuid.uuid4()), "."], capture_output=True, env=env, timeout=30)
+        assert p.returncode != 0 and b"no daemon" in p.stderr
+
+
+# ====================================================================== MCP download_job_files
+@pytest.fixture
+def mcp_mod(server, monkeypatch):
+    """gpu_runner_mcp wired to the test daemon (local CLI, no ssh)."""
+    pytest.importorskip("mcp")
+    import gpu_runner_mcp as m
+    monkeypatch.setattr(m, "GPURUN", os.path.join(HERE, "gpu_runner.py"))
+    monkeypatch.setattr(m, "PYTHON", sys.executable)
+    monkeypatch.setattr(m, "SSH_HOST", None)
+    monkeypatch.setattr(m, "DAEMON_WORKDIR", str(server["tmp"] / "work"))
+    monkeypatch.setenv("GPU_RUNNER_PORT", str(server["port"]))
+    return m
+
+
+@pytest.fixture
+def mcp_job(mcp_mod, tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run.sh").write_text(RESULTS_CMD + "\n")
+    jid = mcp_mod.gpu_submit(str(src), ["sh run.sh"])["job_uuid"]
+    assert mcp_mod.gpu_wait(jid, max_wait_s=60, poll_s=1)["status"] == "COMPLETED"
+    return jid
+
+
+class TestMCPDownload:
+    def test_tool_registered(self, mcp_mod):
+        import asyncio
+        tools = {t.name: t for t in asyncio.run(mcp_mod.mcp.list_tools())}
+        assert "download_job_files" in tools
+        assert {"job_uuid", "files", "overwrite"} <= set(tools["download_job_files"].inputSchema["properties"])
+
+    def test_file_and_dir_to_destinations(self, mcp_mod, mcp_job, tmp_path):
+        dest = tmp_path / "res"
+        r = mcp_mod.download_job_files(mcp_job, {"out/metrics.json": str(dest / "m.json"),
+                                                 "out/plots": str(dest / "plots")})
+        assert "error" not in r, r
+        assert (dest / "m.json").read_text() == '{"acc": 0.9}\n'
+        assert (dest / "plots" / "a.png").read_text() == "png\n"
+        assert r["job_status"] == "COMPLETED" and r["bytes"] > 0 and "warning" not in r
+        assert r["downloaded"] == {"out/metrics.json": str(dest / "m.json"), "out/plots": str(dest / "plots")}
+
+    def test_file_into_existing_dir_or_trailing_slash(self, mcp_mod, mcp_job, tmp_path):
+        (tmp_path / "exists").mkdir()
+        r = mcp_mod.download_job_files(mcp_job, {"train.log": str(tmp_path / "exists"),
+                                                 "out/metrics.json": str(tmp_path / "new") + "/"})
+        assert "error" not in r, r
+        assert (tmp_path / "exists" / "train.log").read_text() == "log\n"
+        assert (tmp_path / "new" / "metrics.json").exists()
+
+    def test_dot_downloads_everything(self, mcp_mod, mcp_job, tmp_path):
+        r = mcp_mod.download_job_files(mcp_job, {".": str(tmp_path / "all")})
+        assert "error" not in r, r
+        got = {str(p.relative_to(tmp_path / "all")) for p in (tmp_path / "all").rglob("*") if p.is_file()}
+        assert got == {"train.log", "run.sh", "out/metrics.json", "out/plots/a.png"}
+
+    def test_dir_merges_into_existing(self, mcp_mod, mcp_job, tmp_path):
+        dest = tmp_path / "plots"
+        dest.mkdir()
+        (dest / "keep.txt").write_text("mine")
+        assert "error" not in mcp_mod.download_job_files(mcp_job, {"out/plots": str(dest)})
+        assert (dest / "keep.txt").read_text() == "mine" and (dest / "a.png").exists()
+
+    def test_overwrite_false_refuses(self, mcp_mod, mcp_job, tmp_path):
+        f = tmp_path / "m.json"
+        f.write_text("old")
+        r = mcp_mod.download_job_files(mcp_job, {"out/metrics.json": str(f)}, overwrite=False)
+        assert "already exists" in r["error"] and f.read_text() == "old"
+        d = tmp_path / "plots"
+        d.mkdir()
+        (d / "a.png").write_text("old")
+        r = mcp_mod.download_job_files(mcp_job, {"out/plots": str(d)}, overwrite=False)
+        assert "already exists" in r["error"] and (d / "a.png").read_text() == "old"
+
+    def test_overwrite_true_replaces(self, mcp_mod, mcp_job, tmp_path):
+        f = tmp_path / "m.json"
+        f.write_text("old")
+        assert "error" not in mcp_mod.download_job_files(mcp_job, {"out/metrics.json": str(f)})
+        assert f.read_text() == '{"acc": 0.9}\n'
+
+    def test_missing_path_writes_nothing(self, mcp_mod, mcp_job, tmp_path):
+        r = mcp_mod.download_job_files(mcp_job, {"train.log": str(tmp_path / "a.log"),
+                                                 "nope.txt": str(tmp_path / "b.txt")})
+        assert "nope.txt" in r["error"]
+        assert list(tmp_path.iterdir()) == [tmp_path / "src"]
+
+    def test_relative_destination_rejected(self, mcp_mod, mcp_job):
+        r = mcp_mod.download_job_files(mcp_job, {"train.log": "results/train.log"})
+        assert "absolute" in r["error"]
+
+    def test_empty_request_and_unknown_job(self, mcp_mod, tmp_path):
+        assert "error" in mcp_mod.download_job_files(str(uuid.uuid4()), {})
+        r = mcp_mod.download_job_files(str(uuid.uuid4()), {".": str(tmp_path / "x")})
+        assert "no such job" in r["error"]
+
+    def test_escaping_path_rejected(self, mcp_mod, mcp_job, tmp_path):
+        r = mcp_mod.download_job_files(mcp_job, {"../": str(tmp_path / "x")})
+        assert "error" in r and not (tmp_path / "x").exists()
+
+    def test_dir_onto_file_rejected(self, mcp_mod, mcp_job, tmp_path):
+        f = tmp_path / "plots"
+        f.write_text("i am a file")
+        assert "is a file" in mcp_mod.download_job_files(mcp_job, {"out/plots": str(f)})["error"]
+
+    def test_running_job_warns(self, mcp_mod, tmp_path):
+        src = tmp_path / "src2"
+        src.mkdir()
+        jid = mcp_mod.gpu_submit(str(src), ["echo early > e.txt; sleep 3"])["job_uuid"]
+        deadline = time.time() + 15
+        r = {"error": "never tried"}
+        while time.time() < deadline:
+            r = mcp_mod.download_job_files(jid, {"e.txt": str(tmp_path / "e.txt")})
+            if "error" not in r:
+                break
+            time.sleep(0.2)
+        assert r.get("job_status") == "RUNNING" and "warning" in r, r
+        assert (tmp_path / "e.txt").read_text() == "early\n"
+        mcp_mod.gpu_wait(jid, max_wait_s=30, poll_s=1)
+
+    def test_safe_extract_rejects_traversal(self, mcp_mod, tmp_path):
+        evil = make_tar({"../evil.txt": "x"})
+        with pytest.raises(Exception):
+            mcp_mod._safe_extract(evil, str(tmp_path / "x"))
+        assert not (tmp_path / "evil.txt").exists()
+
+    def test_call_through_mcp_protocol(self, mcp_mod, mcp_job, tmp_path):
+        import asyncio
+        import json
+        res = asyncio.run(mcp_mod.mcp.call_tool(
+            "download_job_files", {"job_uuid": mcp_job, "files": {"train.log": str(tmp_path / "t.log")}}))
+        content = res[0] if isinstance(res, tuple) else res
+        payload = json.loads(content[0].text)
+        assert payload["job_status"] == "COMPLETED" and (tmp_path / "t.log").read_text() == "log\n"

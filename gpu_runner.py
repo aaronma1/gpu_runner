@@ -5,9 +5,11 @@
     gpu_runner.py submit job.tar "python train.py" "python eval.py" [--message_id ID]
     tar -czf - -C exp . | gpu_runner.py submit - "python train.py"   # tarball from stdin
     gpu_runner.py query JOB_UUID --status --stdout --stderr [--wait]
+    gpu_runner.py download JOB_UUID out/metrics.json out/plots -o results.tar.gz
 
 Over ssh from another machine (the rpyc port only listens on localhost):
     ssh gpu gpu_runner.py submit - "python train.py" --message_id $(uuidgen) < job.tar
+    ssh gpu gpu_runner.py download JOB_UUID out > results.tar.gz
 
 A job is a tarball (extracted into the job's directory) plus shell commands run in order;
 the first failing command stops the job (FAILED). Commands get no stdin. Output goes to
@@ -32,6 +34,7 @@ import rpyc
 DAEMON_WORKDIR = os.path.expanduser(os.environ.get("GPU_RUNNER_WORKDIR", "~/.gpu_runner"))
 PORT = int(os.environ.get("GPU_RUNNER_PORT", 18861))
 TERMINAL = {"COMPLETED", "FAILED"}
+MAX_DOWNLOAD_BYTES = 512  * 1024 * 1024 # 1 TB, arbitrary limit to avoid memory exhaustion
 
 
 def job_env(gpus):
@@ -202,6 +205,60 @@ class Daemon(rpyc.Service):
         with job.mutex:
             return job.status, job.exit_code, job.failed_command
 
+    def exposed_download_job_files(self, job_uuid, files):
+        """tar.gz (bytes) of `files`, paths relative to the job's directory ('.' = everything).
+        Directories are included recursively; each entry is stored under its normalized
+        requested name. All or nothing: FileNotFoundError lists every missing path; ValueError
+        for paths outside the job directory (including via symlinks) or over MAX_DOWNLOAD_BYTES.
+        Works on a running job (files may be mid-write). Runs in the caller's connection
+        thread, so it never blocks the job loop."""
+        job = self._job(job_uuid)
+        files = [str(f) for f in files]  # copy the client's list (a netref) while connected
+        if not files:
+            raise ValueError("no files requested")
+        root = os.path.realpath(job.workdir)
+        if not os.path.isdir(root):
+            with job.mutex:
+                status = job.status
+            raise FileNotFoundError(f"job {job_uuid} has no directory yet (status {status})")
+
+        entries, missing = [], []
+        for f in files:
+            arc = os.path.normpath(f)
+            if os.path.isabs(f) or arc == ".." or arc.startswith(".." + os.sep):
+                raise ValueError(f"{f!r} is not a path inside the job directory")
+            real = os.path.realpath(os.path.join(root, arc))  # follows symlinks
+            if real != root and not real.startswith(root + os.sep):
+                raise ValueError(f"{f!r} resolves outside the job directory")
+            if os.path.exists(real):
+                entries.append((real, arc))
+            else:
+                missing.append(f)
+        if missing:
+            raise FileNotFoundError(f"not found in job {job_uuid}: {', '.join(missing)}")
+
+        total = sum(_tree_size(real) for real, _ in entries)  # before building it in memory
+        if total > MAX_DOWNLOAD_BYTES:
+            raise ValueError(f"requested files total {total / 2**20:.1f} MB, over the "
+                             f"{MAX_DOWNLOAD_BYTES / 2**20:.0f} MB download limit")
+
+        def drop_escaping_links(ti):
+            # A symlink inside a requested directory is stored as a link, not followed. One that
+            # points outside the job dir would let a job smuggle an absolute/../ link into the
+            # client's extraction, so leave it out.
+            if ti.issym() or ti.islnk():
+                target = os.path.realpath(os.path.join(root, os.path.dirname(ti.name), ti.linkname))
+                if target != root and not target.startswith(root + os.sep):
+                    return None
+            return ti
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for real, arc in entries:
+                # arcnames are relative to root, so the filter can resolve links against it
+                tar.add(real, arcname=arc, filter=drop_escaping_links)
+        return buf.getvalue()  # bytes: passed by value
+
     def exposed_list_jobs(self):
         with self.mutex:
             jobs = list(self.jobs.values())
@@ -210,6 +267,22 @@ class Daemon(rpyc.Service):
             with j.mutex:
                 out.append((j.job_uuid, j.status, j.commands[0]))
         return tuple(out)
+
+
+def _tree_size(path):
+    """Bytes in a file, or in all regular files under a directory (symlinks not followed)."""
+    if not os.path.isdir(path):
+        return os.path.getsize(path)
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for name in filenames:
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except FileNotFoundError:
+                continue  # deleted mid-walk (running job)
+            if not (st.st_mode & 0o170000 == 0o120000):  # skip symlinks
+                total += st.st_size
+    return total
 
 
 def _read(path):
@@ -296,6 +369,14 @@ def main():
     parser_query.add_argument("--wait", action="store_true",
                               help="Block until the job finishes; exit 0 iff COMPLETED.")
 
+    parser_download = subparsers.add_parser(
+        "download", help="Write a tar.gz of files from a job's directory.")
+    parser_download.add_argument("job_uuid")
+    parser_download.add_argument("files", nargs="+",
+                                 help="Paths relative to the job directory ('.' = everything).")
+    parser_download.add_argument("-o", "--output", default="-",
+                                 help="Output file ('-' = stdout, the default; use over ssh).")
+
     subparsers.add_parser("list", help="List all jobs.")
 
     args = parser.parse_args()
@@ -339,6 +420,26 @@ def main():
             sys.stderr.write(stderr)
         if args.wait:
             sys.exit(0 if status == "COMPLETED" else 1)
+
+    elif args.command == "download":
+        if args.output == "-" and sys.stdout.isatty():
+            sys.exit("gpu_runner: refusing to write a tar.gz to a terminal; use -o FILE or redirect")
+        conn = connect()
+        try:
+            data = conn.root.download_job_files(args.job_uuid, list(args.files))
+        except (KeyError, FileNotFoundError, ValueError) as e:
+            sys.exit(f"gpu_runner: {e.args[0] if e.args else e}")
+        finally:
+            conn.close()
+        if args.output == "-":
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+        else:
+            try:
+                with open(args.output, "wb") as f:
+                    f.write(data)
+            except OSError as e:
+                sys.exit(f"gpu_runner: cannot write {args.output}: {e}")
 
     elif args.command == "list":
         conn = connect()
