@@ -18,6 +18,10 @@ class gpu_waiter:
         self.claimed = dict()
         self.max_claimed_gpus = max_claimed_gpus
 
+        
+
+
+
 
     def num_claimed(self):
         return sum([1 for holder in self.claimed.values() if holder is not None])
@@ -30,11 +34,9 @@ class gpu_waiter:
             
             # ask to claim free gpus            
             for gpu_id in free_gpus:
-
                 if self.num_claimed() < self.max_claimed_gpus:
                     self.claim_gpu(gpu_id)
                     print(f"Claimed GPU {gpu_id}")
-
 
             # if there are claimed gpus, print them and sleep for 10 seconds
             if len(self.claimed) > 0:
@@ -46,7 +48,7 @@ class gpu_waiter:
 
 
     def claim_gpu(self, gpu_id):
-        self.claimed[gpu_id] = torch.rand(1000, 1000, 1000, device=f"cuda:{gpu_id}")  # Simulate claiming the GPU by allocating a tensor on it
+        self.claimed[gpu_id] = torch.rand(1000, 1000, device=f"cuda:{gpu_id}")  # Simulate claiming the GPU by allocating a tensor on it
 
     def release_gpu(self, gpu_id):
         self.claimed[gpu_id] = None
