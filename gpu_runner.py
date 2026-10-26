@@ -6,6 +6,7 @@
     tar -czf - -C exp . | gpu_runner.py submit - "python train.py"   # tarball from stdin
     gpu_runner.py query JOB_UUID --status --stdout --stderr [--wait]
     gpu_runner.py download JOB_UUID out/metrics.json out/plots -o results.tar.gz
+    gpu_runner.py cancel JOB_UUID                        # dequeue it, or kill it if running
 
 Over ssh from another machine (the rpyc port only listens on localhost):
     ssh gpu gpu_runner.py submit - "python train.py" --message_id $(uuidgen) < job.tar
@@ -14,7 +15,9 @@ Over ssh from another machine (the rpyc port only listens on localhost):
 A job is a tarball (extracted into the job's directory) plus shell commands run in order;
 the first failing command stops the job (FAILED). Commands get no stdin. Output goes to
 <workdir>/<uuid>.stdout/.stderr and can be queried while the job runs. Processes a job
-leaves running in the background are killed when the job ends. Submitting twice with the
+leaves running in the background are killed when the job ends. Cancelling a queued job
+removes it from the queue; cancelling a running one kills all its processes and skips its
+remaining commands (CANCELLED). Submitting twice with the
 same message_id returns the same job instead of queueing a duplicate. Job state is in
 memory: restarting the daemon forgets all jobs.
 """
@@ -33,7 +36,7 @@ import rpyc
 
 DAEMON_WORKDIR = os.path.expanduser(os.environ.get("GPU_RUNNER_WORKDIR", "~/data/.gpu_runner"))
 PORT = int(os.environ.get("GPU_RUNNER_PORT", 18861))
-TERMINAL = {"COMPLETED", "FAILED"}
+TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 MAX_DOWNLOAD_BYTES = 512  * 1024 * 1024 # 1 TB, arbitrary limit to avoid memory exhaustion
 
 
@@ -102,11 +105,16 @@ class Daemon(rpyc.Service):
                 # Output goes to files, not pipes: with pipes, a background child that inherits
                 # them keeps the job "running" until it exits. stdin is /dev/null so a command
                 # that reads input gets EOF instead of blocking on the daemon's stdin.
-                with open(job.stdout_path, "ab") as out, open(job.stderr_path, "ab") as err:
-                    process = subprocess.Popen(command, cwd=job.workdir, shell=True, env=env,
-                                               stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                               start_new_session=True)
+                # Spawned under the job's mutex so a cancel either sees this process group or
+                # stops it from being started.
                 with job.mutex:
+                    if job.cancel_requested:
+                        job.status = "CANCELLED"
+                        return
+                    with open(job.stdout_path, "ab") as out, open(job.stderr_path, "ab") as err:
+                        process = subprocess.Popen(command, cwd=job.workdir, shell=True, env=env,
+                                                   stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                                   start_new_session=True)
                     job.pid = process.pid
                     job.pgids.append(process.pid)  # its own process group (new session)
                 process.wait()
@@ -114,8 +122,11 @@ class Daemon(rpyc.Service):
                     job.exit_code = process.returncode
                 if process.returncode != 0:
                     with job.mutex:
-                        job.failed_command = command
-                        job.status = "FAILED"
+                        if job.cancel_requested:
+                            job.status = "CANCELLED"
+                        else:
+                            job.failed_command = command
+                            job.status = "FAILED"
                     return
             with job.mutex:
                 job.status = "COMPLETED"
@@ -129,6 +140,7 @@ class Daemon(rpyc.Service):
             with job.mutex:
                 job.pid = None
                 job.ended = time.time()
+            job.finished.set()
 
     @staticmethod
     def _kill_leftovers(job):
@@ -259,6 +271,30 @@ class Daemon(rpyc.Service):
                 tar.add(real, arcname=arc, filter=drop_escaping_links)
         return buf.getvalue()  # bytes: passed by value
 
+    def exposed_cancel_job(self, job_uuid, timeout=30):
+        """Cancel a job; returns (status, exit_code, failed_command) like get_job_status.
+        A queued job is dropped from the queue and never runs. A running job has all its
+        process groups killed (SIGTERM, then SIGKILL) and its remaining commands skipped; this
+        waits up to `timeout` s for it to wind down, so its GPUs are free on return. Either
+        way it ends CANCELLED. A job that already finished is left as it is."""
+        job = self._job(job_uuid)
+        with self.mutex:  # same lock order as _loop: daemon, then job
+            with job.mutex:
+                if job.status == "QUEUED":
+                    self.ready.remove(job)
+                    job.status = "CANCELLED"
+                    job.ended = time.time()
+                    job.tarfile = None
+                    job.finished.set()
+                    print(f"Job {job.job_uuid} CANCELLED (queued).", flush=True)
+                elif job.status == "RUNNING":
+                    job.cancel_requested = True
+        if job.cancel_requested:
+            self._kill_leftovers(job)  # no new groups can appear once cancel_requested is set
+            job.finished.wait(timeout)
+        with job.mutex:
+            return job.status, job.exit_code, job.failed_command
+
     def exposed_list_jobs(self):
         with self.mutex:
             jobs = list(self.jobs.values())
@@ -305,11 +341,14 @@ class Job:
 
         self.mutex = threading.Lock()
         self.tarfile = tarfile       # bytes; dropped after extraction (mutex protected)
-        self.status = "QUEUED"       # QUEUED -> RUNNING -> COMPLETED | FAILED (mutex protected)
+        self.status = "QUEUED"       # QUEUED -> RUNNING -> COMPLETED | FAILED | CANCELLED,
+                                     # or QUEUED -> CANCELLED (mutex protected)
         self.pid = None              # mutex protected
         self.exit_code = None        # mutex protected
         self.failed_command = None   # mutex protected
         self.pgids = []              # process groups of its commands (mutex protected)
+        self.cancel_requested = False  # set once by cancel_job (mutex protected)
+        self.finished = threading.Event()  # set when the job is over and its processes are dead
         self.started = self.ended = None
 
 
@@ -337,6 +376,10 @@ def submit_job(tarfile_path, commands, message_id):
         return conn.root.receive_job(message_id, data, list(commands))
     finally:
         conn.close()
+
+
+def print_status(status, exit_code, failed):
+    print(status, "" if exit_code is None else exit_code, f"(failed: {failed})" if failed else "")
 
 
 def main():
@@ -377,6 +420,10 @@ def main():
     parser_download.add_argument("-o", "--output", default="-",
                                  help="Output file ('-' = stdout, the default; use over ssh).")
 
+    parser_cancel = subparsers.add_parser(
+        "cancel", help="Cancel a job (dequeue it, or kill it if running); prints its status.")
+    parser_cancel.add_argument("job_uuid")
+
     subparsers.add_parser("list", help="List all jobs.")
 
     args = parser.parse_args()
@@ -413,7 +460,7 @@ def main():
             conn.close()
         show_all = not (args.status or args.stdout or args.stderr)
         if args.status or show_all or args.wait:
-            print(status, "" if exit_code is None else exit_code, f"(failed: {failed})" if failed else "")
+            print_status(status, exit_code, failed)
         if args.stdout or show_all:
             sys.stdout.write(stdout)
         if args.stderr or show_all:
@@ -440,6 +487,15 @@ def main():
                     f.write(data)
             except OSError as e:
                 sys.exit(f"gpu_runner: cannot write {args.output}: {e}")
+
+    elif args.command == "cancel":
+        conn = connect()
+        try:
+            print_status(*conn.root.cancel_job(args.job_uuid))
+        except KeyError:
+            sys.exit(f"gpu_runner: no such job {args.job_uuid}")
+        finally:
+            conn.close()
 
     elif args.command == "list":
         conn = connect()

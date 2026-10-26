@@ -2,9 +2,13 @@
 # requires-python = ">=3.10"
 # dependencies = ["mcp>=1.2,<2"]
 # ///
-"""MCP server for gpu_runner: lets agents submit jobs, check them, and download their files.
+"""MCP (stdio) server exposing gpu_runner.py to agents.
 
-Every tool shells out to the `gpu_runner.py` CLI (locally, or over ssh when SSH_HOST is set).
+Run:  uv run --script gpu_runner_mcp.py
+
+Talks to the daemon through the gpu_runner.py CLI. With SSH_HOST = None the CLI runs on this
+machine (the daemon's rpyc port only listens on localhost); set SSH_HOST to an ssh alias to
+reach a daemon on another machine.
 """
 import io
 import os
@@ -16,22 +20,21 @@ import tempfile
 import time
 import uuid
 
-from mcp.server.mcpserver import MCPServer as MCP
+from mcp.server.mcpserver import MCPServer
 
-# ---------------------------------------------------------------- hardcoded for now (env overrides)
-GPURUN = os.environ.get("GPU_RUNNER_MCP_GPURUN", "/home/a84456917/Projects/gpu_runner/gpu_runner.py")
-PYTHON = os.environ.get("GPU_RUNNER_MCP_PYTHON",
-                        "/home/a84456917/Projects/gpu_runner/.venv/bin/python")  # env with rpyc
-DAEMON_WORKDIR = os.environ.get("GPU_RUNNER_MCP_WORKDIR", "/home/a84456917/.gpu_runner")
-SSH_HOST = os.environ.get("GPU_RUNNER_MCP_SSH_HOST") or "gpu"  # e.g. "gpu" to go over ssh
+# ---------------------------------------------------------------- hardcoded for now
+GPURUN = "/home/a84456917/Projects/gpu_runner/gpu_runner.py"
+PYTHON = "/home/a84456917/Projects/gpu_runner/.venv/bin/python"   # env that has rpyc
+DAEMON_WORKDIR = "/home/a84456917/.gpu_runner"                    # where job dirs live
+SSH_HOST = "gpu"                                                     # e.g. "gpu" to go over ssh
 
-TERMINAL = {"COMPLETED", "FAILED"}
+TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 EXCLUDE_DIRS = {".git", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
                 ".ipynb_checkpoints", "node_modules", "wandb"}
 MAX_UPLOAD_MB = 500
 SUBMIT_RETRIES = 3
 
-mcp = MCP("gpu_runner")
+mcp = MCPServer("gpu_runner")
 
 
 class RunnerError(RuntimeError):
@@ -88,12 +91,17 @@ def parse_status(line):
     return {"status": status, "exit_code": code, "failed_command": failed}
 
 
-def get_status(job_uuid):
-    out, _ = run_cli(["query", job_uuid, "--status"], timeout=60)
+def status_dict(job_uuid, out):
+    """Status dict from the CLI's status line (`query --status` / `cancel` output)."""
     st = parse_status(out.splitlines()[0] if out else "")
     st["job_uuid"] = job_uuid
     st["job_dir"] = f"{DAEMON_WORKDIR}/{job_uuid}"
     return st
+
+
+def get_status(job_uuid):
+    out, _ = run_cli(["query", job_uuid, "--status"], timeout=60)
+    return status_dict(job_uuid, out)
 
 
 def tail(text, lines):
@@ -148,13 +156,57 @@ def _place(src, dest, job_path, overwrite):
 # ---------------------------------------------------------------- tools
 @mcp.tool()
 def gpu_submit(local_dir: str, commands: list[str]) -> dict:
-    """Queue a job on the GPU box. Uploads local_dir (minus .git/.venv/caches, max 500 MB) and
-    runs `commands` in it, in order, as shell commands; the first failing command stops the job.
-    Jobs run one at a time and each gets all the runner's GPUs (CUDA_VISIBLE_DEVICES is set).
-    Commands get no stdin. Write results to files in the job directory (e.g. out/) and fetch
-    them with download_job_files.
-    There is no cancel and no time limit, so make sure the job terminates.
-    Returns the job_uuid. Safe to call once per job: transport retries reuse one message_id."""
+    """Queue a job on the GPU box: upload a directory, then run shell commands in it.
+
+    Uploads `local_dir` as a gzipped tarball (excluding .git/.venv/caches, max 500 MB) and
+    runs each string in `commands` in order, as a shell command, inside that directory.
+    The first command that exits non-zero stops the job and it is marked FAILED; the
+    remaining commands do not run. Commands get no stdin. Jobs run one at a time and each
+    gets all the runner's GPUs (CUDA_VISIBLE_DEVICES is set). Write results to files in the
+    job directory (e.g. out/) — that is how they can be read back with gpu_output.
+
+    GPUs: the job can use only the GPUs it was given, renumbered from 0 inside the job (use
+    cuda:0, cuda:1, ...; torch.cuda.device_count() says how many). nvidia-smi ignores
+    CUDA_VISIBLE_DEVICES and lists every GPU on the machine, including ones that belong to other
+    people; that is expected and not a choice you need to make. Use all the GPUs the job sees,
+    never pick GPUs from nvidia-smi output, and never set or change CUDA_VISIBLE_DEVICES. You
+    don't need to check whether GPUs are free before submitting: jobs queue and get their GPUs
+    when they start.
+
+    Jobs get a clean interpreter environment: the daemon's own virtualenv is stripped from
+    VIRTUAL_ENV and PATH, so a bare `python` is the system interpreter and `uv` has no venv to
+    fall back to. Create your own and address it explicitly, or nothing gets installed where
+    you expect:
+
+        uv venv
+        uv pip install --python .venv/bin/python numpy
+        .venv/bin/python script.py
+
+    If local_dir has a pyproject.toml, build the environment from it with uv instead. .venv is
+    never uploaded, so every job builds a fresh one, but uv installs from the GPU box's shared
+    cache (~/.cache/uv), so once a package version has been downloaded by any job, later jobs
+    reuse it in seconds instead of downloading it again (the first torch install is slow, later
+    ones aren't). Pin versions in uv.lock so jobs hit the cache and stay reproducible:
+
+        commands = ["uv sync --locked",          # plain `uv sync` if there is no uv.lock
+                    "uv run python train.py"]    # runs in ./.venv, no activation needed
+
+    `uv run` uses the project's ./.venv. Keep heavy dependencies in pyproject.toml rather than
+    installing them with pip in a command, so they come from the cache.
+
+    There is no time limit, so make sure the job terminates; stop a job that won't (or that
+    you no longer need) with gpu_cancel.
+
+    Args:
+        local_dir: local directory to upload as the job's working tree.
+        commands: non-empty list of shell commands, run in order.
+
+    Returns:
+        {"job_uuid": str, "job_dir": str} on success, or {"error": str} on failure.
+
+    Note: idempotent per call — transport retries reuse one message_id, so a retried submit
+    returns the same job rather than queueing a duplicate.
+    """
     if not commands:
         return {"error": "commands must be a non-empty list"}
     try:
@@ -179,8 +231,18 @@ def gpu_submit(local_dir: str, commands: list[str]) -> dict:
 
 @mcp.tool()
 def gpu_status(job_uuid: str) -> dict:
-    """Status of one job: QUEUED, RUNNING, COMPLETED or FAILED, its exit code, the command that
-    failed (if any) and job_dir, the job's working directory on the GPU box."""
+    """Report one job's current state.
+
+    Args:
+        job_uuid: the job's uuid (from gpu_submit or gpu_list).
+
+    Returns:
+        {"status": "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED",
+        "exit_code": int | None,          # exit code of the last command; None until done
+        "failed_command": str | None,     # the failing command when FAILED, else None
+        "job_uuid": str, "job_dir": str}
+        or {"error": str} (e.g. unknown job) on failure.
+    """
     try:
         return get_status(job_uuid)
     except RunnerError as e:
@@ -189,8 +251,15 @@ def gpu_status(job_uuid: str) -> dict:
 
 @mcp.tool()
 def gpu_output(job_uuid: str, tail_lines: int = 200) -> dict:
-    """stdout and stderr of a job (so far, if it is still running): the last `tail_lines` lines
-    of each (0 = everything)."""
+    """Return a job's stdout and stderr so far. Works while the job is still running.
+
+    Args:
+        job_uuid: the job's uuid.
+        tail_lines: return only the last N lines of each stream; 0 returns everything.
+
+    Returns:
+        {"stdout": str, "stderr": str}, or {"error": str} on failure.
+    """
     try:
         out, err = run_cli(["query", job_uuid, "--stdout", "--stderr"], timeout=120)
         return {"stdout": tail(out, tail_lines), "stderr": tail(err, tail_lines)}
@@ -217,16 +286,49 @@ def gpu_wait(job_uuid: str, max_wait_s: int = 600, poll_s: int = 10) -> dict:
 
 
 @mcp.tool()
+def gpu_cancel(job_uuid: str) -> dict:
+    """Cancel a job. A queued job is removed from the queue and never runs. A running job has
+    all its processes killed (SIGTERM, then SIGKILL) and its remaining commands skipped; the
+    call returns once they are gone, so the GPUs are free. Either way the job ends CANCELLED,
+    and its output and files stay available (gpu_output, download_job_files). Cancelling a job
+    that already finished changes nothing and returns its final status.
+
+    Args:
+        job_uuid: the job's uuid.
+
+    Returns:
+        The job's status after the cancel, in the same form as gpu_status, or {"error": str}
+        on failure (e.g. unknown job).
+    """
+    try:
+        out, _ = run_cli(["cancel", job_uuid], timeout=120)
+        return status_dict(job_uuid, out)
+    except RunnerError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
 def download_job_files(job_uuid: str, files: dict[str, str], overwrite: bool = True) -> dict:
-    """Download files from a job's directory on the GPU box to this machine.
-    `files` maps job paths to local destinations, e.g.
-      {"out/metrics.json": "/home/me/exp1/metrics.json", "out/plots": "/home/me/exp1/plots"}.
-    Job paths are relative to the job's directory ("." = everything). Local destinations must be
-    absolute. A directory merges into its destination; a file is written to its destination, or
-    inside it if the destination is an existing directory or ends with "/".
+    """Copy files from a job's directory on the GPU box to this machine.
+
+    Args:
+        job_uuid: the job's uuid.
+        files: maps paths in the job directory to absolute local destinations, e.g.
+            {"out/metrics.json": "/home/me/exp1/metrics.json", "out/plots": "/home/me/exp1/plots"}.
+            Job paths are relative to the job directory; "." is everything. A directory is merged
+            into its destination; a file is written to its destination, or inside it if the
+            destination is an existing directory or ends with "/".
+        overwrite: replace existing local files (default true); if false, an existing file is
+            an error.
+
     Nothing is written if any job path is missing. Total size is capped (1 GB by default), so
-    fetch metrics, logs and plots rather than every checkpoint. Works on a running job, but its
-    files may be incomplete; the result includes the job's status."""
+    fetch metrics, logs and plots rather than every checkpoint. Works while the job is running,
+    but its files may then be incomplete.
+
+    Returns:
+        {"downloaded": {job_path: local_path}, "bytes": int, "job_status": str,
+        "warning": str (only if the job was still running)}, or {"error": str} on failure.
+    """
     if not files:
         return {"error": "files must map at least one job path to a local destination"}
     targets = {}
@@ -259,7 +361,14 @@ def download_job_files(job_uuid: str, files: dict[str, str], overwrite: bool = T
 
 @mcp.tool()
 def gpu_list() -> str:
-    """All jobs the daemon knows (since it last started): uuid, status, first command."""
+    """List every job the daemon knows about since it last started.
+
+    Returns:
+        Text, one line per job: "<job_uuid>  <status>  <first command>".
+        "(no jobs)" when the queue is empty, or "error: <message>" on failure.
+
+    Job state is held in memory, so restarting the daemon forgets all jobs.
+    """
     try:
         out, _ = run_cli(["list"], timeout=60)
         return out or "(no jobs)"

@@ -341,6 +341,124 @@ class TestExecution:
         assert pids_alive(tag) == [], "a background process outlived its job (it could hold a GPU)"
 
 
+# ====================================================================== Daemon: cancel
+def wait_running(status, jid, timeout=15):
+    return wait_status(status, jid, timeout, states={"RUNNING"} | gpu_runner.TERMINAL)
+
+
+class TestCancel:
+    def test_cancelled_is_terminal(self):
+        assert "CANCELLED" in gpu_runner.TERMINAL
+
+    def test_cancel_queued_job_never_runs(self, daemon, tmp_path):
+        marker = tmp_path / "ran"
+        blocker = daemon.submit(["sleep 1"])
+        jid = daemon.submit([f"touch {marker}"])
+        assert daemon.exposed_cancel_job(jid) == ("CANCELLED", None, None)
+        assert jid not in [j.job_uuid for j in daemon.ready]
+        assert daemon.wait(blocker)[0] == "COMPLETED"
+        time.sleep(0.3)
+        assert daemon.status(jid)[0] == "CANCELLED" and not marker.exists()
+        assert not os.path.exists(daemon.jobs[jid].workdir)
+        assert daemon.jobs[jid].tarfile is None and daemon.jobs[jid].ended
+
+    def test_cancel_queued_keeps_rest_of_queue_in_order(self, daemon, tmp_path):
+        order = tmp_path / "order.txt"
+        ids = [daemon.submit([f"sleep 0.2; echo {i} >> {order}"]) for i in range(4)]
+        daemon.exposed_cancel_job(ids[2])
+        for jid in ids:
+            daemon.wait(jid)
+        assert order.read_text().split() == ["0", "1", "3"]
+
+    def test_cancel_running_job(self, daemon):
+        tag = f"cancelme-{uuid.uuid4().hex[:8]}"
+        jid = daemon.submit([f"echo before; bash -c 'exec -a {tag} sleep 60'"])
+        assert wait_running(daemon.status, jid)[0] == "RUNNING"
+        time.sleep(0.3)  # let the command start
+        t0 = time.time()
+        status, code, failed = daemon.exposed_cancel_job(jid)
+        assert status == "CANCELLED" and time.time() - t0 < 10
+        assert code is not None and code != 0 and failed is None
+        assert pids_alive(tag) == []
+        assert daemon.jobs[jid].ended and daemon.jobs[jid].pid is None
+        assert daemon.out(jid)[0] == "before\n"  # output survives the cancel
+
+    def test_cancel_skips_remaining_commands(self, daemon):
+        jid = daemon.submit(["sleep 60", "touch after.txt"])
+        wait_running(daemon.status, jid)
+        time.sleep(0.3)
+        assert daemon.exposed_cancel_job(jid)[0] == "CANCELLED"
+        time.sleep(0.3)
+        assert not os.path.exists(os.path.join(daemon.jobs[jid].workdir, "after.txt"))
+
+    def test_cancel_kills_background_processes(self, daemon):
+        tag = f"cancelbg-{uuid.uuid4().hex[:8]}"
+        jid = daemon.submit([f"(bash -c 'exec -a {tag} sleep 60' &) ; sleep 60"])
+        wait_running(daemon.status, jid)
+        deadline = time.time() + 10
+        while not pids_alive(tag) and time.time() < deadline:
+            time.sleep(0.05)
+        assert pids_alive(tag), "background process never started"
+        daemon.exposed_cancel_job(jid)
+        assert pids_alive(tag) == [], "a cancelled job's background process survived"
+
+    def test_cancel_kills_process_ignoring_sigterm(self, daemon):
+        jid = daemon.submit(["trap '' TERM; echo trapped; while true; do sleep 0.1; done"])
+        wait_running(daemon.status, jid)
+        deadline = time.time() + 10
+        while "trapped" not in daemon.out(jid)[0] and time.time() < deadline:
+            time.sleep(0.05)
+        t0 = time.time()
+        assert daemon.exposed_cancel_job(jid)[0] == "CANCELLED" and time.time() - t0 < 10
+
+    def test_next_job_runs_after_cancel(self, daemon):
+        jid = daemon.submit(["sleep 60"])
+        nxt = daemon.submit(["echo next"])
+        wait_running(daemon.status, jid)
+        daemon.exposed_cancel_job(jid)
+        assert daemon.wait(nxt) == ("COMPLETED", 0, None)
+        assert daemon.out(nxt)[0] == "next\n"
+
+    def test_cancel_finished_job_is_noop(self, daemon):
+        ok = daemon.submit(["true"])
+        bad = daemon.submit(["exit 3"])
+        daemon.wait(ok), daemon.wait(bad)
+        assert daemon.exposed_cancel_job(ok) == ("COMPLETED", 0, None)
+        assert daemon.exposed_cancel_job(bad) == ("FAILED", 3, "exit 3")
+        assert daemon.status(ok)[0] == "COMPLETED" and daemon.status(bad)[0] == "FAILED"
+
+    def test_cancel_twice_is_idempotent(self, daemon):
+        blocker = daemon.submit(["sleep 60"])
+        queued = daemon.submit(["true"])
+        wait_running(daemon.status, blocker)
+        for _ in range(2):
+            assert daemon.exposed_cancel_job(queued)[0] == "CANCELLED"
+            assert daemon.exposed_cancel_job(blocker)[0] == "CANCELLED"
+
+    def test_cancel_right_after_submit(self, daemon, tmp_path):
+        # races cancel against the loop picking the job up and against command start
+        for i in range(10):
+            marker = tmp_path / f"ran{i}"
+            jid = daemon.submit([f"sleep 0.5; touch {marker}"])
+            time.sleep(0.01 * i)
+            assert daemon.exposed_cancel_job(jid)[0] == "CANCELLED"
+            assert daemon.wait(jid)[0] == "CANCELLED"
+        time.sleep(0.7)
+        assert list(tmp_path.glob("ran*")) == []
+
+    def test_cancel_unknown_job_raises_keyerror(self, daemon):
+        with pytest.raises(KeyError):
+            daemon.exposed_cancel_job(str(uuid.uuid4()))
+
+    def test_cancelled_job_listed(self, daemon):
+        blocker = daemon.submit(["sleep 1"])
+        jid = daemon.submit(["echo never"])
+        daemon.exposed_cancel_job(jid)
+        rows = {r[0]: r for r in daemon.exposed_list_jobs()}
+        assert rows[jid][1] == "CANCELLED"
+        daemon.exposed_cancel_job(blocker)
+
+
 # ====================================================================== Daemon: failures
 class TestFailures:
     def test_first_failure_stops_job(self, daemon):
@@ -602,6 +720,15 @@ class TestRPC:
             s.settimeout(2)
             assert s.connect_ex((ext[0], server["port"])) != 0
 
+    def test_cancel_over_rpc(self, conn):
+        jid = rpc_submit(conn, ["sleep 60"])
+        wait_status(conn.root.get_job_status, jid, 15, states={"RUNNING"})
+        res = conn.root.cancel_job(jid)
+        assert type(res) is tuple and res[0] == "CANCELLED"
+        assert conn.root.get_job_status(jid)[0] == "CANCELLED"
+        with pytest.raises(KeyError):
+            conn.root.cancel_job(str(uuid.uuid4()))
+
     def test_only_exposed_methods_reachable(self, conn):
         with pytest.raises(AttributeError):
             conn.root._run_job
@@ -676,12 +803,34 @@ class TestCLI:
         lines = cli(server, "list").stdout.decode().splitlines()
         assert any(l.startswith(jid) and "COMPLETED" in l and "echo listed" in l for l in lines)
 
+    def test_cancel(self, server):
+        jid = cli(server, "submit", "", "sleep 60", "echo never").stdout.decode().strip()
+        p = cli(server, "cancel", jid)
+        assert p.returncode == 0 and p.stdout.decode().startswith("CANCELLED"), p
+        q = cli(server, "query", jid, "--wait")
+        assert q.returncode == 1 and q.stdout.decode().startswith("CANCELLED")
+        assert b"never" not in cli(server, "query", jid, "--stdout").stdout
+
+    def test_cancel_finished_job_reports_status(self, server):
+        jid = cli(server, "submit", "", "exit 5").stdout.decode().strip()
+        cli(server, "query", jid, "--wait")
+        p = cli(server, "cancel", jid)
+        assert p.returncode == 0 and p.stdout.decode().startswith("FAILED 5 (failed: exit 5)")
+
+    def test_cancel_unknown_job(self, server):
+        p = cli(server, "cancel", str(uuid.uuid4()))
+        assert p.returncode != 0 and b"no such job" in p.stderr and b"Traceback" not in p.stderr
+
+    def test_cancel_requires_a_job(self, server):
+        assert cli(server, "cancel").returncode == 2
+
     def test_no_subcommand_is_usage_error(self, server):
         assert cli(server).returncode == 2
 
     def test_no_daemon_is_clean_error(self, server):
         env = dict(server["env"], GPU_RUNNER_PORT=str(free_port()))
-        for args in (["submit", "", "true"], ["query", str(uuid.uuid4())], ["list"]):
+        for args in (["submit", "", "true"], ["query", str(uuid.uuid4())], ["list"],
+                     ["cancel", str(uuid.uuid4())]):
             p = subprocess.run(RUNNER + args, capture_output=True, env=env, timeout=30)
             assert p.returncode != 0 and b"no daemon" in p.stderr and b"Traceback" not in p.stderr, args
 
@@ -1088,3 +1237,51 @@ class TestMCPDownload:
         content = getattr(res, "content", res)
         payload = json.loads(content[0].text)
         assert payload["job_status"] == "COMPLETED" and (tmp_path / "t.log").read_text() == "log\n"
+
+
+# ====================================================================== MCP gpu_cancel
+class TestMCPCancel:
+    def test_tool_registered(self, mcp_mod):
+        import asyncio
+        tools = {t.name: t for t in asyncio.run(mcp_mod.mcp.list_tools())}
+        assert "gpu_cancel" in tools
+        schema = getattr(tools["gpu_cancel"], "input_schema", None) or getattr(tools["gpu_cancel"], "inputSchema")
+        assert set(schema["properties"]) == {"job_uuid"}
+
+    def test_cancel_running_job(self, mcp_mod, tmp_path):
+        jid = mcp_mod.gpu_submit(str(tmp_path), ["echo started; sleep 60", "echo never"])["job_uuid"]
+        deadline = time.time() + 15
+        while mcp_mod.gpu_status(jid)["status"] != "RUNNING" and time.time() < deadline:
+            time.sleep(0.2)
+        r = mcp_mod.gpu_cancel(jid)
+        assert r["status"] == "CANCELLED" and r["failed_command"] is None, r
+        assert r["job_uuid"] == jid and r["job_dir"].endswith(jid)
+        assert mcp_mod.gpu_wait(jid, max_wait_s=10, poll_s=1)["status"] == "CANCELLED"
+        assert "never" not in mcp_mod.gpu_output(jid)["stdout"]
+
+    def test_cancel_queued_job(self, mcp_mod, tmp_path):
+        blocker = mcp_mod.gpu_submit(str(tmp_path), ["sleep 60"])["job_uuid"]
+        jid = mcp_mod.gpu_submit(str(tmp_path), ["echo never"])["job_uuid"]
+        assert mcp_mod.gpu_cancel(jid)["status"] == "CANCELLED"
+        assert mcp_mod.gpu_cancel(blocker)["status"] == "CANCELLED"
+        assert mcp_mod.gpu_output(jid)["stdout"] == ""
+
+    def test_cancel_finished_job_is_noop(self, mcp_mod, mcp_job):
+        r = mcp_mod.gpu_cancel(mcp_job)
+        assert r["status"] == "COMPLETED" and r["exit_code"] == 0
+
+    def test_files_still_downloadable_after_cancel(self, mcp_mod, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        jid = mcp_mod.gpu_submit(str(src), ["echo partial > p.txt; sleep 60"])["job_uuid"]
+        deadline = time.time() + 15
+        while "error" in mcp_mod.download_job_files(jid, {"p.txt": str(tmp_path / "probe.txt")}) \
+                and time.time() < deadline:
+            time.sleep(0.2)
+        assert mcp_mod.gpu_cancel(jid)["status"] == "CANCELLED"
+        r = mcp_mod.download_job_files(jid, {"p.txt": str(tmp_path / "p.txt")})
+        assert r["job_status"] == "CANCELLED" and "warning" not in r, r
+        assert (tmp_path / "p.txt").read_text() == "partial\n"
+
+    def test_cancel_unknown_job(self, mcp_mod):
+        assert "no such job" in mcp_mod.gpu_cancel(str(uuid.uuid4()))["error"]
