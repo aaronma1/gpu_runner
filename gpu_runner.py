@@ -61,6 +61,9 @@ def job_env(gpus):
                                       if p and os.path.realpath(p) != venv_bin)
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # so indices match nvidia-smi
+    env["UV_CACHE_DIR"] = JOB_UV_CACHE
+    env["XDG_CACHE_HOME"] = JOB_CACHE
+    
     return env
 
 
