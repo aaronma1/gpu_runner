@@ -13,13 +13,16 @@ table of $GPURUN_CONFIG_DIR/config.toml (default ~/.config/gpu_runner/config.tom
 
     [mcp]
     ssh_host = "gpu"            # ssh alias of the GPU box; omit to run the CLI on this machine
-    gpurun = "/home/me/Projects/gpu_runner/gpu_runner.py"        # paths on the GPU box
-    python = "/home/me/Projects/gpu_runner/.venv/bin/python"     # env that has rpyc; "" runs
-                                                                 # gpurun directly (make install)
     daemon_workdir = "/home/me/data/.gpu_runner"                 # where job dirs live
 
-Without ssh_host the CLI runs locally (the daemon's rpyc port only listens on localhost), and
-gpurun/python default to the installed gpu_runner command, else this checkout and its .venv.
+With ssh_host the CLI is run as `ssh gpu .local/bin/gpu_runner <args>`, where `make install` on
+that machine puts it (optionally behind its ssh gate); nothing about that machine is configured
+here. Without it the CLI runs locally (the daemon's rpyc port only listens
+on localhost): the installed gpu_runner command, else this checkout and its .venv, overridable with
+
+    gpurun = "/home/me/Projects/gpu_runner/gpu_runner.py"
+    python = "/home/me/Projects/gpu_runner/.venv/bin/python"     # env that has rpyc; "" runs
+                                                                 # gpurun directly
 """
 import io
 import os
@@ -53,11 +56,16 @@ def load_config():
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = load_config()
 INSTALLED = shutil.which("gpu_runner")  # from `make install`; runs on its own venv
+# local only: a remote daemon is always reached as `ssh HOST .local/bin/gpu_runner ...`
 GPURUN = CONFIG.get("gpurun", INSTALLED or os.path.join(HERE, "gpu_runner.py"))
 # env that has rpyc; "" runs GPURUN directly
 PYTHON = CONFIG.get("python", "" if INSTALLED else os.path.join(HERE, ".venv", "bin", "python"))
-DAEMON_WORKDIR = CONFIG.get("daemon_workdir", os.path.expanduser("~/data/.gpu_runner"))
 SSH_HOST = CONFIG.get("ssh_host") or None  # None: run the CLI on this machine
+# where `make install` puts gpu_runner on SSH_HOST; ssh runs commands in $HOME
+REMOTE_GPURUN = ".local/bin/gpu_runner"
+# a remote daemon's default workdir is under its own home, not ours
+DAEMON_WORKDIR = CONFIG.get("daemon_workdir", "~/data/.gpu_runner" if SSH_HOST
+                            else os.path.expanduser("~/data/.gpu_runner"))
 
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 EXCLUDE_DIRS = {".git", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
@@ -75,9 +83,10 @@ class RunnerError(RuntimeError):
 def run_cli(args, stdin=None, timeout=120, binary=False):
     """Run `gpu_runner.py <args>`; returns (stdout, stderr), stdout as bytes if `binary`.
     Raises RunnerError on failure."""
-    cmd = [PYTHON, GPURUN, *args] if PYTHON else [GPURUN, *args]
     if SSH_HOST:
-        cmd = ["ssh", "-o", "BatchMode=yes", SSH_HOST, shlex.join(cmd)]
+        cmd = ["ssh", "-o", "BatchMode=yes", SSH_HOST, shlex.join([REMOTE_GPURUN, *args])]
+    else:
+        cmd = [PYTHON, GPURUN, *args] if PYTHON else [GPURUN, *args]
     try:
         p = subprocess.run(cmd, input=stdin, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:

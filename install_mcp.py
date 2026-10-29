@@ -1,9 +1,10 @@
 """Interactive setup for gpu_runner_mcp.py, run by `make install-mcp`.
 
-Asks which machine runs the gpu_runner daemon and where gpu_runner lives there, checks that the
-CLI answers, writes the [mcp] table of $GPURUN_CONFIG_DIR/config.toml (default
-~/.config/gpu_runner/config.toml; other tables are kept), installs gate.sh (filled in with those
-paths) on a remote host, and registers the server with Claude Code.
+Asks which machine runs the gpu_runner daemon, checks that `gpu_runner list` answers there (over
+`ssh HOST .local/bin/gpu_runner list` for a remote one, exactly as the MCP server calls it), writes the
+[mcp] table of $GPURUN_CONFIG_DIR/config.toml (default ~/.config/gpu_runner/config.toml; other
+tables are kept), and registers the server with Claude Code. Nothing is written to the remote
+machine: `make install` there provides gpu_runner (and its ssh gate).
 
     python install_mcp.py --python VENV_PYTHON --script INSTALLED_MCP_SCRIPT
 """
@@ -17,15 +18,8 @@ import sys
 import tomllib
 
 NAME = "gpu_runner"
+REMOTE_GPURUN = ".local/bin/gpu_runner"  # as in gpu_runner_mcp.py: `make install`'s, from $HOME
 HERE = os.path.dirname(os.path.abspath(__file__))
-# prints $HOME, then the gpu_runner command if installed (non-interactive ssh may lack ~/.local/bin)
-PROBE = ('echo "$HOME"; command -v gpu_runner || '
-         '{ [ -x "$HOME/.local/bin/gpu_runner" ] && echo "$HOME/.local/bin/gpu_runner"; }; true')
-# the venv `make install` creates (rpyc) and `make install-mcp` reuses (mcp), relative to $HOME
-VENV_PYTHON = ".local/share/gpu_runner/venv/bin/python"
-# where gate.sh (the authorized_keys forced command) is installed, relative to $HOME
-GATE = ".local/share/gpu_runner/gate.sh"
-GATED = "gate: not allowed"  # what gate.sh says when it refuses a command
 
 
 def config_path():
@@ -38,13 +32,12 @@ def ask(prompt, default=""):
     return answer or default
 
 
-def run(cmd, host=None, timeout=30, input=None):
-    """Run `cmd` here, or on `host` over ssh, feeding it `input`; (returncode, stdout+stderr)."""
+def run(cmd, host=None, timeout=30):
+    """Run `cmd` here, or on `host` over ssh; (returncode, stdout+stderr)."""
     if host:
         cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, shlex.join(cmd)]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           input=input if input is not None else "")
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, str(e)
     return p.returncode, (p.stdout + p.stderr).strip()
@@ -89,90 +82,38 @@ def configure(path):
     print("or `local` for this machine.")
     host = ask("ssh host", old.get("ssh_host") or "local")
     host = "" if host == "local" else host
-    if (old.get("ssh_host") or "") != host:  # old paths are for another machine
-        old = {}
+    values = {"ssh_host": host}
+    if not host:  # a remote daemon's workdir is that machine's business, not the MCP config's
+        home = os.path.expanduser("~")
+        default = old.get("daemon_workdir") if not old.get("ssh_host") else None
+        values["daemon_workdir"] = ask("daemon workdir on this machine",
+                                       default or f"{home}/data/.gpu_runner")
 
-    # If the key behind `host` is restricted by gate.sh, only `gpu_runner list` gets through, so
-    # probing and writing gate.sh go through `setup`, an alias for the same machine that isn't.
-    setup = host
-    code, out = run(["sh", "-c", PROBE], setup)
-    while host and code != 0 and GATED in out:
-        print(f"{setup} is restricted by gate.sh. Give another ssh alias for that machine whose")
-        print("key isn't, or leave it empty to keep the saved settings and gate.sh and only check them.")
-        setup = ask("setup ssh host")
-        if not setup:
-            return check_saved(path, host, old)
-        code, out = run(["sh", "-c", PROBE], setup)
-    if code != 0:
-        sys.exit(f"install_mcp: can't reach {setup or 'this machine'}: {out}\n"
-                 "(the MCP server uses `ssh -o BatchMode=yes`, so key-based login must work)")
-    home, *found = out.splitlines()
-    where = host or "this machine"
-
-    if found:
-        print(f"found gpu_runner on {where}: {found[0]}")
-        gpurun_default = found[0]
-    elif not host:
-        gpurun_default = os.path.join(HERE, "gpu_runner.py")
-    else:
-        print(f"no gpu_runner command on {host} (`make install` there provides one)")
-        gpurun_default = f"{home}/Projects/gpu_runner/gpu_runner.py"
-
-    def path_on_host(p):  # paths are passed quoted over ssh, so expand ~ here
-        return home + p[1:] if p == "~" or p.startswith("~/") else p
-
-    gpurun = path_on_host(ask(f"gpu_runner on {where}", old.get("gpurun", gpurun_default)))
-    python = f"{home}/{VENV_PYTHON}"
-    workdir = path_on_host(ask(f"daemon workdir on {where}",
-                               old.get("daemon_workdir", f"{home}/data/.gpu_runner")))
-
-    if host:  # before the check below, so a gated `host` is let through with the new paths
-        install_gate(setup, host, f"{home}/{GATE}", python, gpurun)
-
-    code, out = check_list(host, python, gpurun)
+    code, out = check_list(host)
     if code == 0:
         print("gpu_runner answered:\n  " + (out.replace("\n", "\n  ") or "(no jobs)"))
     else:
-        print(f"gpu_runner list failed (is the daemon running?):\n  {out}")
+        where = host or "this machine"
+        print(f"gpu_runner list on {where} failed:\n  {out}")
+        if host:
+            print(f"(needs key-based `ssh -o BatchMode=yes {host}`, `make install` on {host} "
+                  "and the daemon running)")
         if ask("save these settings anyway? [y/N]").lower() != "y":
             sys.exit(1)
 
-    write_mcp_table(path, {"ssh_host": host, "gpurun": gpurun, "python": python,
-                           "daemon_workdir": workdir})
+    write_mcp_table(path, values)
     print(f"wrote [mcp] to {path}")
 
 
-def check_list(host, python, gpurun):
+def check_list(host):
     """Run `gpu_runner list` the way the MCP server will; (returncode, output)."""
-    return run([python, gpurun, "list"] if python else [gpurun, "list"], host, timeout=60)
-
-
-def check_saved(path, host, old):
-    """Only `list` gets through the gate, so keep the saved settings if they still work."""
-    if "gpurun" not in old:
-        sys.exit(f"install_mcp: no saved settings for {host} to keep; run this again with an alias "
-                 "whose key isn't restricted, or drop the command= option from its authorized_keys "
-                 "line until setup is done")
-    code, out = check_list(host, old.get("python", ""), old["gpurun"])
-    if code != 0:
-        sys.exit(f"install_mcp: gpu_runner list through the gate failed with the settings in "
-                 f"{path}:\n  {out}")
-    print("gpu_runner answered:\n  " + (out.replace("\n", "\n  ") or "(no jobs)"))
-    print(f"kept [mcp] in {path}")
-
-
-def install_gate(setup, host, dest, python, gpurun):
-    """Write gate.sh, filled in with the paths the MCP server calls, to `dest` on `host`
-    (reached through the ssh alias `setup`)."""
-    with open(os.path.join(HERE, "gate.sh")) as f:
-        text = f.read().replace("@PY@", shlex.quote(python)).replace("@RUNNER@", shlex.quote(gpurun))
-    code, out = run(["sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1" && chmod 755 "$1"',
-                     "sh", dest], setup, input=text)
-    if code != 0:
-        sys.exit(f"install_mcp: can't write {dest} on {host}: {out}")
-    print(f"wrote {dest} on {host}; to restrict this key to gpu_runner, prefix its line in "
-          f"{host}:~/.ssh/authorized_keys with\n"
-          f'  command="{dest}",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty')
+    if host:
+        return run([REMOTE_GPURUN, "list"], host, timeout=60)
+    gpurun = shutil.which("gpu_runner")
+    if gpurun:
+        return run([gpurun, "list"], timeout=60)
+    return run([os.path.join(HERE, ".venv", "bin", "python"),
+                os.path.join(HERE, "gpu_runner.py"), "list"], timeout=60)
 
 
 def register(python, script):
