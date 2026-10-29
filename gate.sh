@@ -1,7 +1,9 @@
 #!/bin/sh
 # Only allow: <venv python> <gpu_runner.py> submit|query|list|download|cancel ...
-PY=/home/a84456917/Projects/gpu_runner/.venv/bin/python
-RUNNER=/home/a84456917/Projects/gpu_runner/gpu_runner.py
+# Template: `make install-mcp` fills in @PY@/@RUNNER@ and installs it on the ssh host as an
+# authorized_keys forced command.
+PY=@PY@
+RUNNER=@RUNNER@
 set -f                                    # no globbing while re-splitting
 eval "set -- $SSH_ORIGINAL_COMMAND"       # split the requested command like a shell would
 [ "$1" = "$PY" ] && [ "$2" = "$RUNNER" ] || { echo "gate: not allowed" >&2; exit 2; }
