@@ -20,6 +20,14 @@ removes it from the queue; cancelling a running one kills all its processes and 
 remaining commands (CANCELLED). Submitting twice with the
 same message_id returns the same job instead of queueing a duplicate. Job state is in
 memory: restarting the daemon forgets all jobs.
+
+Settings are read at startup from the [runner] table of $GPURUN_CONFIG_DIR/config.toml
+(default ~/.config/gpu_runner/config.toml); GPU_RUNNER_<KEY> environment variables override it:
+    [runner]
+    workdir = "~/data/.gpu_runner"                  # job directories and their stdout/stderr
+    job_uv_cache = "~/data/.cache/gpu_runner/uv"    # UV_CACHE_DIR for jobs
+    job_cache = "~/data/.cache/gpu_runner"          # XDG_CACHE_HOME for jobs
+    port = 18861                                    # rpyc port (localhost only)
 """
 import argparse
 import io
@@ -30,15 +38,36 @@ import sys
 import tarfile
 import threading
 import time
+import tomllib
 import uuid
 
 import rpyc
 
-DAEMON_WORKDIR = os.path.expanduser(os.environ.get("GPU_RUNNER_WORKDIR", "~/data/.gpu_runner"))
-JOB_UV_CACHE = os.path.expanduser(os.environ.get("GPU_RUNNER_JOB_UV_CACHE", "~/data/.cache/gpu_runner/uv"))
-JOB_CACHE = os.path.expanduser(os.environ.get("GPU_RUNNER_JOB_CACHE", "~/data/.cache/gpu_runner"))
 
-PORT = int(os.environ.get("GPU_RUNNER_PORT", 18861))
+def load_config():
+    """The [runner] table of $GPURUN_CONFIG_DIR/config.toml (default ~/.config/gpu_runner);
+    {} if the file doesn't exist. GPU_RUNNER_* environment variables override its values."""
+    config_dir = os.path.expanduser(os.environ.get("GPURUN_CONFIG_DIR", "~/.config/gpu_runner"))
+    path = os.path.join(config_dir, "config.toml")
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f).get("runner", {})
+    except FileNotFoundError:
+        return {}
+    except tomllib.TOMLDecodeError as e:
+        sys.exit(f"gpu_runner: bad config file {path}: {e}")
+
+
+def setting(config, key, default):
+    return os.environ.get(f"GPU_RUNNER_{key.upper()}", config.get(key, default))
+
+
+CONFIG = load_config()
+DAEMON_WORKDIR = os.path.expanduser(setting(CONFIG, "workdir", "~/data/.gpu_runner"))
+JOB_UV_CACHE = os.path.expanduser(setting(CONFIG, "job_uv_cache", "~/data/.cache/gpu_runner/uv"))
+JOB_CACHE = os.path.expanduser(setting(CONFIG, "job_cache", "~/data/.cache/gpu_runner"))
+
+PORT = int(setting(CONFIG, "port", 18861))
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 MAX_DOWNLOAD_BYTES = 512  * 1024 * 1024 # 1 TB, arbitrary limit to avoid memory exhaustion
 

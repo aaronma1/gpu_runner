@@ -1,32 +1,63 @@
 # /// script
-# requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2,<2"]
+# requires-python = ">=3.11"
+# dependencies = ["mcp>=2.3,<3"]
 # ///
 """MCP (stdio) server exposing gpu_runner.py to agents.
 
 Run:  uv run --script gpu_runner_mcp.py
+Install for Claude Code (venv in ~/.local/gpurunner_mcp, asks for the settings below):
+      make install-mcp
 
-Talks to the daemon through the gpu_runner.py CLI. With SSH_HOST = None the CLI runs on this
-machine (the daemon's rpyc port only listens on localhost); set SSH_HOST to an ssh alias to
-reach a daemon on another machine.
+Talks to the daemon through the gpu_runner.py CLI. Settings are read at startup from the [mcp]
+table of $GPURUN_CONFIG_DIR/config.toml (default ~/.config/gpu_runner/config.toml):
+
+    [mcp]
+    ssh_host = "gpu"            # ssh alias of the GPU box; omit to run the CLI on this machine
+    gpurun = "/home/me/Projects/gpu_runner/gpu_runner.py"        # paths on the GPU box
+    python = "/home/me/Projects/gpu_runner/.venv/bin/python"     # env that has rpyc; "" runs
+                                                                 # gpurun directly (make install)
+    daemon_workdir = "/home/me/data/.gpu_runner"                 # where job dirs live
+
+Without ssh_host the CLI runs locally (the daemon's rpyc port only listens on localhost), and
+gpurun/python default to the installed gpu_runner command, else this checkout and its .venv.
 """
 import io
 import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 import uuid
 
 from mcp.server.mcpserver import MCPServer
 
-# ---------------------------------------------------------------- hardcoded for now
-GPURUN = "/home/a84456917/Projects/gpu_runner/gpu_runner.py"
-PYTHON = "/home/a84456917/Projects/gpu_runner/.venv/bin/python"   # env that has rpyc
-DAEMON_WORKDIR = "/home/a84456917/.gpu_runner"                    # where job dirs live
-SSH_HOST = "gpu"                                                     # e.g. "gpu" to go over ssh
+
+def load_config():
+    """The [mcp] table of $GPURUN_CONFIG_DIR/config.toml (default ~/.config/gpu_runner);
+    {} if the file doesn't exist."""
+    config_dir = os.path.expanduser(os.environ.get("GPURUN_CONFIG_DIR", "~/.config/gpu_runner"))
+    path = os.path.join(config_dir, "config.toml")
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f).get("mcp", {})
+    except FileNotFoundError:
+        return {}
+    except tomllib.TOMLDecodeError as e:
+        sys.exit(f"gpu_runner_mcp: bad config file {path}: {e}")
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG = load_config()
+INSTALLED = shutil.which("gpu_runner")  # from `make install`; runs on its own venv
+GPURUN = CONFIG.get("gpurun", INSTALLED or os.path.join(HERE, "gpu_runner.py"))
+# env that has rpyc; "" runs GPURUN directly
+PYTHON = CONFIG.get("python", "" if INSTALLED else os.path.join(HERE, ".venv", "bin", "python"))
+DAEMON_WORKDIR = CONFIG.get("daemon_workdir", os.path.expanduser("~/data/.gpu_runner"))
+SSH_HOST = CONFIG.get("ssh_host") or None  # None: run the CLI on this machine
 
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 EXCLUDE_DIRS = {".git", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
@@ -44,7 +75,7 @@ class RunnerError(RuntimeError):
 def run_cli(args, stdin=None, timeout=120, binary=False):
     """Run `gpu_runner.py <args>`; returns (stdout, stderr), stdout as bytes if `binary`.
     Raises RunnerError on failure."""
-    cmd = [PYTHON, GPURUN, *args]
+    cmd = [PYTHON, GPURUN, *args] if PYTHON else [GPURUN, *args]
     if SSH_HOST:
         cmd = ["ssh", "-o", "BatchMode=yes", SSH_HOST, shlex.join(cmd)]
     try:
