@@ -2,13 +2,13 @@
 # requires-python = ">=3.11"
 # dependencies = ["mcp>=2.3,<3"]
 # ///
-"""MCP (stdio) server exposing gpu_runner.py to agents.
+"""MCP (stdio) server exposing the gpu_runner CLI to agents.
 
-Run:  uv run --script gpu_runner_mcp.py
+Run:  uv run --script mcp_server.py
 Install for Claude Code (venv in ~/.local/gpurunner_mcp, asks for the settings below):
       make install-mcp
 
-Talks to the daemon through the gpu_runner.py CLI. Settings are read at startup from the [mcp]
+Talks to the daemon through the gpu_runner CLI (main.py). Settings are read at startup from the [mcp]
 table of $GPURUN_CONFIG_DIR/config.toml (default ~/.config/gpu_runner/config.toml):
 
     [mcp]
@@ -20,7 +20,7 @@ that machine puts it (optionally behind its ssh gate); nothing about that machin
 here. Without it the CLI runs locally (the daemon's rpyc port only listens
 on localhost): the installed gpu_runner command, else this checkout and its .venv, overridable with
 
-    gpurun = "/home/me/Projects/gpu_runner/gpu_runner.py"
+    gpurun = "/home/me/Projects/gpu_runner/main.py"
     python = "/home/me/Projects/gpu_runner/.venv/bin/python"     # env that has rpyc; "" runs
                                                                  # gpurun directly
 """
@@ -35,15 +35,16 @@ import uuid
 
 from mcp.server.mcpserver import MCPServer
 
-from gpu_runner_utils import TERMINAL, load_config, safe_extract, tar_gz
+from utils import TERMINAL, load_config, safe_extract, tar_gz
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)  # the checkout (sources are in src/)
 CONFIG = load_config("mcp", "gpu_runner_mcp")
 INSTALLED = shutil.which("gpu_runner")  # from `make install`; runs on its own venv
 # local only: a remote daemon is always reached as `ssh HOST .local/bin/gpu_runner ...`
-GPURUN = CONFIG.get("gpurun", INSTALLED or os.path.join(HERE, "gpu_runner.py"))
+GPURUN = CONFIG.get("gpurun", INSTALLED or os.path.join(HERE, "main.py"))
 # env that has rpyc; "" runs GPURUN directly
-PYTHON = CONFIG.get("python", "" if INSTALLED else os.path.join(HERE, ".venv", "bin", "python"))
+PYTHON = CONFIG.get("python", "" if INSTALLED else os.path.join(ROOT, ".venv", "bin", "python"))
 SSH_HOST = CONFIG.get("ssh_host") or None  # None: run the CLI on this machine
 # where `make install` puts gpu_runner on SSH_HOST; ssh runs commands in $HOME
 REMOTE_GPURUN = ".local/bin/gpu_runner"
@@ -64,7 +65,7 @@ class RunnerError(RuntimeError):
 
 
 def run_cli(args, stdin=None, timeout=120, binary=False):
-    """Run `gpu_runner.py <args>`; returns (stdout, stderr), stdout as bytes if `binary`.
+    """Run `gpu_runner <args>`; returns (stdout, stderr), stdout as bytes if `binary`.
     Raises RunnerError on failure."""
     if SSH_HOST:
         cmd = ["ssh", "-o", "BatchMode=yes", SSH_HOST, shlex.join([REMOTE_GPURUN, *args])]

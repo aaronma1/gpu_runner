@@ -1,4 +1,4 @@
-"""Interactive setup for gpu_runner_mcp.py, run by `make install-mcp`.
+"""Interactive setup for mcp_server.py, run by `make install-mcp`.
 
 Asks which machine runs the gpu_runner daemon, checks that `gpu_runner list` answers there (over
 `ssh HOST .local/bin/gpu_runner list` for a remote one, exactly as the MCP server calls it), writes the
@@ -18,8 +18,9 @@ import sys
 import tomllib
 
 NAME = "gpu_runner"
-REMOTE_GPURUN = ".local/bin/gpu_runner"  # as in gpu_runner_mcp.py: `make install`'s, from $HOME
+REMOTE_GPURUN = ".local/bin/gpu_runner"  # as in mcp_server.py: `make install`'s, from $HOME
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)  # the checkout (sources are in src/)
 
 
 def config_path():
@@ -112,8 +113,8 @@ def check_list(host):
     gpurun = shutil.which("gpu_runner")
     if gpurun:
         return run([gpurun, "list"], timeout=60)
-    return run([os.path.join(HERE, ".venv", "bin", "python"),
-                os.path.join(HERE, "gpu_runner.py"), "list"], timeout=60)
+    return run([os.path.join(ROOT, ".venv", "bin", "python"),
+                os.path.join(HERE, "main.py"), "list"], timeout=60)
 
 
 def register(python, script):
@@ -131,7 +132,7 @@ def register(python, script):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--python", required=True, help="python of the MCP server's venv")
-    ap.add_argument("--script", required=True, help="installed gpu_runner_mcp.py")
+    ap.add_argument("--script", required=True, help="installed mcp_server.py")
     ap.add_argument("--no-register", action="store_true", help="only write the config")
     args = ap.parse_args()
     configure(config_path())

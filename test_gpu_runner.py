@@ -1,4 +1,4 @@
-"""Test suite for gpu_runner.py.
+"""Test suite for gpu_runner (main.py and the modules it imports).
 
     pytest -q test_gpu_runner.py                 # everything (~1-2 min)
     pytest -q test_gpu_runner.py -k "not slow"   # skip the throughput/size tests
@@ -6,9 +6,9 @@
 
 Layers:
   * Daemon        — the Daemon class in-process: exposed_* called directly, _loop in a thread.
-  * RPC           — a real `gpu_runner.py daemon` subprocess, driven with rpyc.connect.
-  * CLI           — the same daemon, driven with `gpu_runner.py submit/query/download/list`.
-  * MCP           — gpu_runner_mcp.py tools against the same daemon (skipped without `mcp`).
+  * RPC           — a real `main.py daemon` subprocess, driven with rpyc.connect.
+  * CLI           — the same daemon, driven with `main.py submit/query/download/list`.
+  * MCP           — mcp_server.py tools against the same daemon (skipped without `mcp`).
 No GPU is needed; GPU ids are only checked as CUDA_VISIBLE_DEVICES.
 """
 import io
@@ -26,10 +26,14 @@ import pytest
 import rpyc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-import gpu_runner  # noqa: E402
+SRC = os.path.join(HERE, "src")
+sys.path.insert(0, SRC)
+import daemon as daemon_mod  # noqa: E402  (the `daemon` fixture would shadow it)
+from job import Job  # noqa: E402
+from runner import JobRunner, job_env  # noqa: E402
+from utils import TERMINAL  # noqa: E402
 
-RUNNER = [sys.executable, os.path.join(HERE, "gpu_runner.py")]
+RUNNER = [sys.executable, os.path.join(SRC, "main.py")]
 GPUS = [int(g) for g in os.environ.get("GPU_RUNNER_TEST_GPUS", "0,1").split(",")]
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
@@ -66,7 +70,7 @@ def wait_for_port(port, timeout=10):
     return False
 
 
-def wait_status(get_status, jid, timeout=30, states=gpu_runner.TERMINAL):
+def wait_status(get_status, jid, timeout=30, states=TERMINAL):
     deadline = time.time() + timeout
     while time.time() < deadline:
         st = get_status(jid)
@@ -85,7 +89,7 @@ def pids_alive(pattern):
 @pytest.fixture
 def daemon(tmp_path):
     """In-process Daemon with a fast poll, its loop running in a background thread."""
-    d = gpu_runner.Daemon(str(tmp_path / "work"), GPUS, poll=0.05)
+    d = daemon_mod.Daemon(str(tmp_path / "work"), GPUS, poll=0.05)
     os.makedirs(d.workdir)
     threading.Thread(target=d._loop, daemon=True).start()
     d.submit = lambda cmds, tar=b"", mid=None: d.exposed_receive_job(mid or str(uuid.uuid4()), tar, cmds)
@@ -220,14 +224,14 @@ class TestLifecycle:
             st = daemon.status(jid)[0]
             if not seen or seen[-1] != st:
                 seen.append(st)
-            if st in gpu_runner.TERMINAL:
+            if st in TERMINAL:
                 break
             time.sleep(0.02)
         assert seen[-2:] == ["RUNNING", "COMPLETED"]
         assert set(seen) <= {"QUEUED", "RUNNING", "COMPLETED"}
 
     def test_transition_table(self):
-        job = gpu_runner.Job("j", None, ["true"], "/nonexistent")
+        job = Job("j", None, ["true"], "/nonexistent")
         with pytest.raises(RuntimeError, match="QUEUED -> COMPLETED"):
             job.transition("COMPLETED")  # must start running first
         job.transition("RUNNING")
@@ -242,7 +246,7 @@ class TestLifecycle:
         assert job.status == "FAILED"
 
     def test_queued_can_be_cancelled_directly(self):
-        job = gpu_runner.Job("j", b"tar", ["true"], "/nonexistent")
+        job = Job("j", b"tar", ["true"], "/nonexistent")
         job.transition("CANCELLED")
         assert job.started is None and job.ended and job.tarfile is None and job.finished.is_set()
 
@@ -262,7 +266,7 @@ class TestLifecycle:
     def test_never_two_running(self, daemon):
         ids = [daemon.submit(["sleep 0.3"]) for _ in range(5)]
         max_running = 0
-        while not all(daemon.status(j)[0] in gpu_runner.TERMINAL for j in ids):
+        while not all(daemon.status(j)[0] in TERMINAL for j in ids):
             running = sum(daemon.status(j)[0] == "RUNNING" for j in ids)
             max_running = max(max_running, running)
             time.sleep(0.01)
@@ -375,12 +379,12 @@ class TestExecution:
 
 # ====================================================================== Daemon: cancel
 def wait_running(status, jid, timeout=15):
-    return wait_status(status, jid, timeout, states={"RUNNING"} | gpu_runner.TERMINAL)
+    return wait_status(status, jid, timeout, states={"RUNNING"} | TERMINAL)
 
 
 class TestCancel:
     def test_cancelled_is_terminal(self):
-        assert "CANCELLED" in gpu_runner.TERMINAL
+        assert "CANCELLED" in TERMINAL
 
     def test_cancel_queued_job_never_runs(self, daemon, tmp_path):
         marker = tmp_path / "ran"
@@ -598,6 +602,51 @@ class TestTarballs:
         assert daemon.wait(b)[0] == "FAILED"
 
 
+# ====================================================================== JobRunner (no daemon)
+class TestJobRunner:
+    @staticmethod
+    def make_job(tmp_path, commands, tar=None):
+        return Job("j", tar, commands, str(tmp_path / "j"))
+
+    def test_runs_to_completion(self, tmp_path):
+        job = self.make_job(tmp_path, ["cat in.txt", 'echo "[$CUDA_VISIBLE_DEVICES]"'],
+                            tar=make_tar({"in.txt": b"hello\n"}))
+        runner = JobRunner(job, [3, 4])
+        assert not runner.done()
+        runner.start()
+        assert job.finished.wait(30) and runner.done()
+        assert job.status == "COMPLETED" and job.exit_code == 0 and job.tarfile is None
+        assert open(job.stdout_path).read() == "hello\n[3,4]\n"
+
+    def test_failure_records_command(self, tmp_path):
+        job = self.make_job(tmp_path, ["true", "exit 7", "echo never"])
+        JobRunner(job, []).start()
+        assert job.finished.wait(30)
+        assert (job.status, job.exit_code, job.failed_command) == ("FAILED", 7, "exit 7")
+        assert "never" not in open(job.stdout_path).read()
+
+    def test_cancel(self, tmp_path):
+        job = self.make_job(tmp_path, ["sleep 60", "echo never"])
+        runner = JobRunner(job, [])
+        runner.start()
+        deadline = time.time() + 15
+        while not job.pgids and time.time() < deadline:  # wait for `sleep 60` to be spawned
+            time.sleep(0.05)
+        assert job.pgids
+        runner.cancel(timeout=15)
+        assert job.status == "CANCELLED" and runner.done()
+        runner.cancel()  # no-op once terminal
+        assert job.status == "CANCELLED"
+
+    def test_start_twice_rejected(self, tmp_path):
+        job = self.make_job(tmp_path, ["true"])
+        runner = JobRunner(job, [])
+        runner.start()
+        with pytest.raises(RuntimeError):
+            runner.start()
+        job.finished.wait(30)
+
+
 # ====================================================================== Daemon: environment
 class TestEnvironment:
     def test_cuda_visible_devices(self, daemon):
@@ -606,7 +655,7 @@ class TestEnvironment:
         assert daemon.out(jid)[0].strip() == ",".join(map(str, GPUS)) + "|PCI_BUS_ID"
 
     def test_no_gpus_means_empty_cvd(self, tmp_path):
-        d = gpu_runner.Daemon(str(tmp_path / "w"), [], poll=0.05)
+        d = daemon_mod.Daemon(str(tmp_path / "w"), [], poll=0.05)
         threading.Thread(target=d._loop, daemon=True).start()
         jid = d.exposed_receive_job("m", b"", ['echo "[$CUDA_VISIBLE_DEVICES]"'])
         wait_status(d.exposed_get_job_status, jid)
@@ -633,7 +682,7 @@ class TestEnvironment:
         monkeypatch.setenv("VIRTUAL_ENV", "/opt/daemon-venv/")  # trailing slash must not matter
         monkeypatch.setenv("VIRTUAL_ENV_PROMPT", "daemon")
         monkeypatch.setenv("PATH", "/opt/daemon-venv/bin:/usr/bin")
-        env = gpu_runner.job_env([2, 3])
+        env = job_env([2, 3])
         assert "VIRTUAL_ENV" not in env and "VIRTUAL_ENV_PROMPT" not in env
         assert env["PATH"] == "/usr/bin"
         assert env["CUDA_VISIBLE_DEVICES"] == "2,3"
@@ -763,7 +812,7 @@ class TestRPC:
 
     def test_only_exposed_methods_reachable(self, conn):
         with pytest.raises(AttributeError):
-            conn.root._run_job
+            conn.root._loop
         with pytest.raises(AttributeError):
             conn.root.jobs
 
@@ -1031,7 +1080,7 @@ class TestDownload:
         assert self.dl(daemon, jid, ["crash.txt"]) == {"crash.txt": b"crash-log\n"}
 
     def test_size_limit(self, daemon, monkeypatch):
-        monkeypatch.setattr(gpu_runner, "MAX_DOWNLOAD_BYTES", 1024)
+        monkeypatch.setattr(daemon_mod, "MAX_DOWNLOAD_BYTES", 1024)
         jid = daemon.submit(["mkdir d && head -c 600 /dev/zero > d/a && head -c 600 /dev/zero > d/b"])
         daemon.wait(jid)
         assert self.dl(daemon, jid, ["d/a"])  # one file fits
@@ -1039,7 +1088,7 @@ class TestDownload:
             daemon.exposed_download_job_files(jid, ["d"])  # the directory total does not
 
     def test_size_limit_ignores_symlink_targets(self, daemon, monkeypatch):
-        monkeypatch.setattr(gpu_runner, "MAX_DOWNLOAD_BYTES", 1024)
+        monkeypatch.setattr(daemon_mod, "MAX_DOWNLOAD_BYTES", 1024)
         jid = daemon.submit(["mkdir d && head -c 900 /dev/zero > d/a && ln -s a d/b"])
         daemon.wait(jid)
         assert "d/a" in self.dl(daemon, jid, ["d"])
@@ -1132,10 +1181,10 @@ class TestDownload:
 # ====================================================================== MCP download_job_files
 @pytest.fixture
 def mcp_mod(server, monkeypatch):
-    """gpu_runner_mcp wired to the test daemon (local CLI, no ssh)."""
+    """mcp_server wired to the test daemon (local CLI, no ssh)."""
     pytest.importorskip("mcp")
-    import gpu_runner_mcp as m
-    monkeypatch.setattr(m, "GPURUN", os.path.join(HERE, "gpu_runner.py"))
+    import mcp_server as m
+    monkeypatch.setattr(m, "GPURUN", os.path.join(SRC, "main.py"))
     monkeypatch.setattr(m, "PYTHON", sys.executable)
     monkeypatch.setattr(m, "SSH_HOST", None)
     monkeypatch.setattr(m, "DAEMON_WORKDIR", str(server["tmp"] / "work"))

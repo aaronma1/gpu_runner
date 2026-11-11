@@ -1,4 +1,4 @@
-"""Helpers shared by gpu_runner.py (daemon + CLI) and gpu_runner_mcp.py.
+"""Helpers shared by the daemon, the CLI (main.py) and mcp_server.py.
 
 Installed next to both scripts (`make install` / `make install-mcp` put it in $(LIBDIR)); keep it
 stdlib-only so either venv can import it.
