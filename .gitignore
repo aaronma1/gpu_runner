@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+gpu_runner
 
 # Virtual environments
 .venv

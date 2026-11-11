@@ -2,7 +2,7 @@
 
 A single-queue GPU job daemon. A job is a tarball (extracted into the job's own directory) plus a
 list of shell commands, run in order on the daemon's GPUs. Jobs run one at a time; each gets all
-the daemon's GPUs through `CUDA_VISIBLE_DEVICES`. An MCP server (`mcp_server.py`) lets
+the daemon's GPUs through `CUDA_VISIBLE_DEVICES`. An MCP server (`src/mcp_server.py`) lets
 agents such as Claude Code submit and manage jobs, either on this machine or on a GPU box reached
 over ssh.
 
@@ -15,7 +15,7 @@ make install        # ~/.local/bin/gpu_runner, on its own venv in ~/.local/share
 gpu_runner daemon --gpu 0 1
 ```
 
-`make install` copies `main.py` and the modules it imports into `~/.local/share/gpu_runner`
+`make install` copies `src/main.py` and the modules it imports into `~/.local/share/gpu_runner`
 (linked from `~/.local/bin/gpu_runner`), so re-run it after changing any of them. `make uninstall`
 removes the command and its venv. Set `PREFIX`, `BINDIR` or `LIBDIR` to install elsewhere.
 
@@ -87,7 +87,7 @@ port = 18861                                    # rpyc port (localhost only)
 [mcp]                                           # written by `make install-mcp`
 ssh_host = "gpu"                                # ssh alias of the GPU box; "" = this machine
 daemon_workdir = "/home/me/data/.gpu_runner"    # local daemon only
-# gpurun = ".../main.py"                        # local only: override which CLI to run
+# gpurun = ".../src/main.py"                    # local only: override which CLI to run
 # python = ".../.venv/bin/python"               # and its interpreter ("" runs gpurun directly)
 ```
 
@@ -107,14 +107,16 @@ daemon_workdir = "/home/me/data/.gpu_runner"    # local daemon only
 
 | file | contents |
 | --- | --- |
-| `main.py` | CLI entrypoint (`gpu_runner`): parses arguments, starts the daemon or runs a client command |
-| `daemon.py` | `Daemon`: the job queue and rpyc interface; `serve()` runs it |
-| `runner.py` | `JobRunner`: runs one job on the GPUs, from start to a terminal state, and cancels it |
-| `job.py` | `Job`: a job's data and state machine |
-| `client.py` | the CLI's client commands (submit, query, download, cancel, list) |
-| `config.py` | `[runner]` settings |
-| `utils.py` | helpers shared with the MCP server (config loading, tar handling) |
-| `mcp_server.py` | the MCP server |
+| `src/main.py` | CLI entrypoint (`gpu_runner`): parses arguments, starts the daemon or runs a client command |
+| `src/daemon.py` | `Daemon`: the job queue and rpyc interface; `serve()` runs it |
+| `src/runner.py` | `JobRunner`: runs one job on the GPUs, from start to a terminal state, and cancels it |
+| `src/job.py` | `Job`: a job's data and state machine |
+| `src/client.py` | the CLI's client commands (submit, query, download, cancel, list) |
+| `src/config.py` | `[runner]` settings |
+| `src/utils.py` | helpers shared with the MCP server (config loading, tar handling) |
+| `src/mcp_server.py` | the MCP server |
+| `src/install_mcp.py` | interactive setup for the MCP server, run by `make install-mcp` |
+| `src/gate.py` | the ssh forced command installed by `make install` |
 
 ```sh
 uv sync

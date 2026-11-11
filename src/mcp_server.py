@@ -20,7 +20,7 @@ that machine puts it (optionally behind its ssh gate); nothing about that machin
 here. Without it the CLI runs locally (the daemon's rpyc port only listens
 on localhost): the installed gpu_runner command, else this checkout and its .venv, overridable with
 
-    gpurun = "/home/me/Projects/gpu_runner/main.py"
+    gpurun = "/home/me/Projects/gpu_runner/src/main.py"
     python = "/home/me/Projects/gpu_runner/.venv/bin/python"     # env that has rpyc; "" runs
                                                                  # gpurun directly
 """
