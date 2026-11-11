@@ -129,15 +129,27 @@ def register(python, script):
     subprocess.run(cmd, check=True)
 
 
+def jiuwenswarm_config(python, script):
+    """The mcpServers JSON to paste into the jiuwenswarm web UI (Extensions -> Connector ->
+    Create -> Configure connector -> Add JSON config)."""
+    server = {"command": python, "args": [script]}
+    if "GPURUN_CONFIG_DIR" in os.environ:
+        server["env"] = {"GPURUN_CONFIG_DIR": os.environ["GPURUN_CONFIG_DIR"]}
+    return json.dumps({"mcpServers": {NAME: server}}, indent=2)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--python", required=True, help="python of the MCP server's venv")
     ap.add_argument("--script", required=True, help="installed mcp_server.py")
-    ap.add_argument("--no-register", action="store_true", help="only write the config")
+    ap.add_argument("--no-register", action="store_true",
+                    help="only write the config (don't register with Claude Code)")
     args = ap.parse_args()
     configure(config_path())
     if not args.no_register:
         register(args.python, args.script)
+    print("\nfor the jiuwenswarm web UI, paste this under Extensions -> Connector -> Create -> "
+          "Configure connector -> Add JSON config:\n" + jiuwenswarm_config(args.python, args.script))
 
 
 if __name__ == "__main__":

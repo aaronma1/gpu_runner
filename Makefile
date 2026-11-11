@@ -5,7 +5,8 @@
 # make uninstall -> removes the command and its venv
 # make install-mcp   -> mcp_server.py in $(LIBDIR), run on the same venv, then asks which host
 #                       runs the daemon (reached as `ssh HOST gpu_runner ...`), writes the [mcp]
-#                       config and registers it with Claude Code
+#                       config and registers it with Claude Code (MCP_FLAGS=--no-register to
+#                       skip that, e.g. for jiuwenswarm only); prints the jiuwenswarm web UI JSON
 # make uninstall-mcp -> unregisters it and removes the script (the venv and config file are kept)
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -43,7 +44,7 @@ install-mcp: $(PYTHON)
 	uv pip install --python $(PYTHON) 'mcp>=2.3,<3'
 	install -m 644 src/utils.py $(LIBDIR)/utils.py
 	install -m 644 src/mcp_server.py $(LIBDIR)/mcp_server.py
-	$(PYTHON) src/install_mcp.py --python $(PYTHON) --script $(LIBDIR)/mcp_server.py
+	$(PYTHON) src/install_mcp.py --python $(PYTHON) --script $(LIBDIR)/mcp_server.py $(MCP_FLAGS)
 
 uninstall-mcp:
 	-claude mcp remove -s user gpu_runner

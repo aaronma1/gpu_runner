@@ -1,5 +1,7 @@
-"""JobRunner: runs a single Job on the daemon's GPUs, from RUNNING to a terminal state."""
+"""JobRunner: runs a single Job on the daemon's GPUs, from RUNNING to a terminal state.
+BwrapJobRunner does the same with each command inside a bubblewrap sandbox."""
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -98,10 +100,23 @@ class JobRunner:
         finally:
             try:
                 self._kill_leftovers()
+                self._cleanup()
+            except Exception as e:
+                with open(job.stderr_path, "a") as err:
+                    err.write(f"\n[gpu_runner] job cleanup error: {type(e).__name__}: {e}\n")
             finally:
                 with job.mutex:
                     job.failed_command = failed_command
                     job.transition(outcome)
+
+    def _cleanup(self):
+        """Hook: undo _setup's extras once the job's processes are dead (the job dir stays)."""
+
+    def _spawn(self, command, env, out, err):
+        """Hook: start one command in its own session (so its process group is killable)."""
+        return subprocess.Popen(command, cwd=self.job.workdir, shell=True, env=env,
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                start_new_session=True)
 
     def _run_commands(self):
         """Run the job's commands in order; returns (outcome, failed_command) where outcome is
@@ -118,9 +133,7 @@ class JobRunner:
                 if job.cancel_requested:
                     return "CANCELLED", None
                 with open(job.stdout_path, "ab") as out, open(job.stderr_path, "ab") as err:
-                    process = subprocess.Popen(command, cwd=job.workdir, shell=True, env=env,
-                                               stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                               start_new_session=True)
+                    process = self._spawn(command, env, out, err)
                 job.pid = process.pid
                 job.pgids.append(process.pid)  # its own process group (new session)
             process.wait()
@@ -144,3 +157,65 @@ class JobRunner:
             if not alive:
                 return
             time.sleep(1)
+
+
+class BwrapJobRunner(JobRunner):
+    """A JobRunner that runs each command inside a bubblewrap (bwrap) sandbox:
+
+      * the whole filesystem is read-only, except the job's own directory, the job caches
+        (UV_CACHE_DIR / XDG_CACHE_HOME) and a private /tmp that lives for the whole job
+        (so files left in /tmp by one command are seen by the next);
+      * the daemon's workdir is hidden behind an empty tmpfs, so a job can't see other jobs;
+      * /dev is passed through (the GPUs), the network is shared, and the sandbox dies with
+        the daemon.
+
+    No new pid namespace or session: the command stays in the process group the runner kills,
+    so leftover processes and cancellation behave exactly as with the plain JobRunner (and
+    helpers a command starts in the background survive for later commands)."""
+
+    BWRAP = "bwrap"
+
+    @classmethod
+    def check(cls):
+        """Raise RuntimeError unless bwrap is installed and can create a sandbox here
+        (unprivileged user namespaces can be disabled by the kernel or an LSM)."""
+        if shutil.which(cls.BWRAP) is None:
+            raise RuntimeError(f"{cls.BWRAP} not found on PATH")
+        p = subprocess.run([cls.BWRAP, "--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev",
+                            "true"], capture_output=True, text=True)
+        if p.returncode != 0:
+            raise RuntimeError(f"{cls.BWRAP} can't create a sandbox: {p.stderr.strip()}")
+
+    @property
+    def tmpdir(self):
+        return self.job.workdir + ".tmp"  # next to the job dir, like its .stdout/.stderr
+
+    def _setup(self):
+        super()._setup()
+        os.makedirs(self.tmpdir)
+        for d in (JOB_UV_CACHE, JOB_CACHE):
+            os.makedirs(d, exist_ok=True)  # bwrap can only bind directories that exist
+
+    def _cleanup(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def bwrap_argv(self, command):
+        # Mounts apply in order, each on top of the earlier ones (sources are host paths), so
+        # /tmp goes first: the daemon workdir or caches may themselves be under /tmp.
+        workdir = self.job.workdir
+        args = [self.BWRAP,
+                "--ro-bind", "/", "/",
+                "--dev-bind", "/dev", "/dev",
+                "--bind", self.tmpdir, "/tmp",
+                "--tmpfs", os.path.dirname(workdir),  # hide the other jobs
+                "--bind", workdir, workdir]
+        for d in (JOB_UV_CACHE, JOB_CACHE):
+            args += ["--bind", d, d]
+        return args + ["--die-with-parent", "--chdir", workdir, "/bin/sh", "-c", command]
+
+    def _spawn(self, command, env, out, err):
+        return subprocess.Popen(self.bwrap_argv(command), env=env, stdin=subprocess.DEVNULL,
+                                stdout=out, stderr=err, start_new_session=True)
+
+
+RUNNERS = {"plain": JobRunner, "bwrap": BwrapJobRunner}

@@ -30,7 +30,8 @@ SRC = os.path.join(HERE, "src")
 sys.path.insert(0, SRC)
 import daemon as daemon_mod  # noqa: E402  (the `daemon` fixture would shadow it)
 from job import Job  # noqa: E402
-from runner import JobRunner, job_env  # noqa: E402
+import runner as runner_mod  # noqa: E402
+from runner import BwrapJobRunner, JobRunner, job_env  # noqa: E402
 from utils import TERMINAL  # noqa: E402
 
 RUNNER = [sys.executable, os.path.join(SRC, "main.py")]
@@ -603,31 +604,58 @@ class TestTarballs:
 
 
 # ====================================================================== JobRunner (no daemon)
+def bwrap_unavailable():
+    try:
+        BwrapJobRunner.check()
+    except RuntimeError as e:
+        return str(e)
+    return None
+
+
+needs_bwrap = pytest.mark.skipif(bwrap_unavailable() is not None,
+                                 reason=f"bwrap unusable: {bwrap_unavailable()}")
+
+
+@pytest.fixture
+def job_caches(tmp_path, monkeypatch):
+    """Point the job caches at tmp dirs (BwrapJobRunner creates and binds them)."""
+    monkeypatch.setattr(runner_mod, "JOB_UV_CACHE", str(tmp_path / "cache" / "uv"))
+    monkeypatch.setattr(runner_mod, "JOB_CACHE", str(tmp_path / "cache" / "xdg"))
+    return tmp_path / "cache"
+
+
+@pytest.fixture(params=["plain", pytest.param("bwrap", marks=needs_bwrap)])
+def runner_cls(request, job_caches):
+    return runner_mod.RUNNERS[request.param]
+
+
 class TestJobRunner:
+    """Behaviour every runner must share; runs against JobRunner and BwrapJobRunner."""
     @staticmethod
     def make_job(tmp_path, commands, tar=None):
-        return Job("j", tar, commands, str(tmp_path / "j"))
+        os.makedirs(tmp_path / "work", exist_ok=True)
+        return Job("j", tar, commands, str(tmp_path / "work" / "j"))
 
-    def test_runs_to_completion(self, tmp_path):
+    def test_runs_to_completion(self, tmp_path, runner_cls):
         job = self.make_job(tmp_path, ["cat in.txt", 'echo "[$CUDA_VISIBLE_DEVICES]"'],
                             tar=make_tar({"in.txt": b"hello\n"}))
-        runner = JobRunner(job, [3, 4])
+        runner = runner_cls(job, [3, 4])
         assert not runner.done()
         runner.start()
         assert job.finished.wait(30) and runner.done()
         assert job.status == "COMPLETED" and job.exit_code == 0 and job.tarfile is None
         assert open(job.stdout_path).read() == "hello\n[3,4]\n"
 
-    def test_failure_records_command(self, tmp_path):
+    def test_failure_records_command(self, tmp_path, runner_cls):
         job = self.make_job(tmp_path, ["true", "exit 7", "echo never"])
-        JobRunner(job, []).start()
+        runner_cls(job, []).start()
         assert job.finished.wait(30)
         assert (job.status, job.exit_code, job.failed_command) == ("FAILED", 7, "exit 7")
         assert "never" not in open(job.stdout_path).read()
 
-    def test_cancel(self, tmp_path):
+    def test_cancel(self, tmp_path, runner_cls):
         job = self.make_job(tmp_path, ["sleep 60", "echo never"])
-        runner = JobRunner(job, [])
+        runner = runner_cls(job, [])
         runner.start()
         deadline = time.time() + 15
         while not job.pgids and time.time() < deadline:  # wait for `sleep 60` to be spawned
@@ -638,13 +666,77 @@ class TestJobRunner:
         runner.cancel()  # no-op once terminal
         assert job.status == "CANCELLED"
 
-    def test_start_twice_rejected(self, tmp_path):
+    def test_start_twice_rejected(self, tmp_path, runner_cls):
         job = self.make_job(tmp_path, ["true"])
-        runner = JobRunner(job, [])
+        runner = runner_cls(job, [])
         runner.start()
         with pytest.raises(RuntimeError):
             runner.start()
         job.finished.wait(30)
+
+
+    def test_background_helper_lives_until_job_end(self, tmp_path, runner_cls):
+        job = self.make_job(tmp_path, ["(sleep 60 &) ; true", "sleep 0.3; pgrep -f 'sleep 60' >/dev/null"])
+        runner_cls(job, []).start()
+        assert job.finished.wait(30)
+        assert job.status == "COMPLETED", open(job.stderr_path).read()
+        for pgid in job.pgids:
+            with pytest.raises(ProcessLookupError):
+                os.killpg(pgid, 0)
+
+
+@needs_bwrap
+class TestBwrapJobRunner:
+    """What the sandbox adds on top of JobRunner."""
+    @staticmethod
+    def run(tmp_path, commands, name="j"):
+        os.makedirs(tmp_path / "work", exist_ok=True)
+        job = Job(name, None, commands, str(tmp_path / "work" / name))
+        BwrapJobRunner(job, []).start()
+        assert job.finished.wait(30)
+        return job, open(job.stdout_path).read(), open(job.stderr_path).read()
+
+    def test_job_dir_and_caches_writable(self, tmp_path, job_caches):
+        job, out, err = self.run(tmp_path, ["touch here && touch $UV_CACHE_DIR/x $XDG_CACHE_HOME/y"])
+        assert job.status == "COMPLETED", err
+        assert (tmp_path / "work" / "j" / "here").exists()
+        assert (job_caches / "uv" / "x").exists() and (job_caches / "xdg" / "y").exists()
+
+    def test_rest_of_filesystem_read_only(self, tmp_path, job_caches):
+        outside = os.path.join(HERE, f".gpu_runner_test_{uuid.uuid4().hex}")
+        try:
+            job, _, err = self.run(tmp_path, [f"touch {outside}"])
+            assert job.status == "FAILED" and "Read-only" in err
+            assert not os.path.exists(outside)
+        finally:
+            if os.path.exists(outside):
+                os.remove(outside)
+
+    def test_host_tmp_not_visible(self, tmp_path, job_caches):
+        # tmp_path is under the host's /tmp; the job's /tmp is its own, so a write lands there
+        job, _, err = self.run(tmp_path, [f"mkdir -p {tmp_path} && touch {tmp_path}/outside"])
+        assert job.status == "COMPLETED", err
+        assert not (tmp_path / "outside").exists()
+
+    def test_other_jobs_hidden(self, tmp_path, job_caches):
+        self.run(tmp_path, ["echo secret > s.txt"], name="a")
+        job, out, err = self.run(tmp_path, [f"ls {tmp_path / 'work'}"], name="b")
+        assert job.status == "COMPLETED", err
+        assert out.split() == ["b"]
+
+    def test_private_tmp_shared_between_commands_then_removed(self, tmp_path, job_caches):
+        marker = f"gpu_runner_test_{uuid.uuid4().hex}"
+        job, _, err = self.run(tmp_path, [f"echo hi > /tmp/{marker}", f"cat /tmp/{marker}"])
+        assert job.status == "COMPLETED", err
+        assert not os.path.exists(f"/tmp/{marker}")  # it was the job's own /tmp
+        assert not os.path.exists(job.workdir + ".tmp")
+
+    def test_daemon_with_bwrap_runner(self, tmp_path, job_caches):
+        d = daemon_mod.Daemon(str(tmp_path / "w"), [], poll=0.05, runner_cls=BwrapJobRunner)
+        threading.Thread(target=d._loop, daemon=True).start()
+        jid = d.exposed_receive_job("m", make_tar({"in.txt": b"sandboxed\n"}), ["cat in.txt"])
+        assert wait_status(d.exposed_get_job_status, jid)[0] == "COMPLETED"
+        assert d.exposed_get_job_out(jid)[0] == "sandboxed\n"
 
 
 # ====================================================================== Daemon: environment

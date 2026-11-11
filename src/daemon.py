@@ -19,10 +19,11 @@ class Daemon(rpyc.Service):
     """The job queue and rpyc interface: accepts jobs, runs them one at a time (each through a
     JobRunner), and answers status/output/download/cancel requests."""
 
-    def __init__(self, workdir, gpus=None, poll=1.0, verbose=False):
+    def __init__(self, workdir, gpus=None, poll=1.0, verbose=False, runner_cls=JobRunner):
         self.workdir = workdir
         self.gpus = list(gpus or [])
         self.poll = poll
+        self.runner_cls = runner_cls  # JobRunner or a subclass (e.g. BwrapJobRunner)
 
         self.mutex = threading.Lock()
         self.messages_received = {}  # message_id -> job_uuid                 (mutex protected)
@@ -42,7 +43,7 @@ class Daemon(rpyc.Service):
                     self.running = None
                 if self.running is None and self.ready:
                     job = self.ready.pop(0)
-                    self.running = JobRunner(job, self.gpus, verbose=self.verbose)
+                    self.running = self.runner_cls(job, self.gpus, verbose=self.verbose)
                     self.running.start()
                     print(f"Job {job.job_uuid} started.", flush=True)
             time.sleep(self.poll)
@@ -191,14 +192,14 @@ def _read(path):
         return ""
 
 
-def serve(workdir, gpus, verbose=False):
+def serve(workdir, gpus, verbose=False, runner_cls=JobRunner):
     """Run the daemon in the foreground until Ctrl-C."""
     os.makedirs(workdir, exist_ok=True)
-    daemon = Daemon(workdir, gpus, verbose=verbose)
+    daemon = Daemon(workdir, gpus, verbose=verbose, runner_cls=runner_cls)
     server = rpyc.ThreadedServer(daemon, hostname="localhost", port=PORT,  # NOT 0.0.0.0
                                  protocol_config={"sync_request_timeout": 600})
     threading.Thread(target=server.start, daemon=True).start()
-    print(f"GPU daemon on localhost:{PORT}, gpus={gpus}, workdir={workdir}", flush=True)
+    print(f"GPU daemon on localhost:{PORT}, gpus={gpus}, workdir={workdir}, runner={runner_cls.__name__}", flush=True)
     try:
         daemon._loop()  # only returns by raising; anything but Ctrl-C prints its traceback
     except KeyboardInterrupt:

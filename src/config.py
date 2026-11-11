@@ -7,6 +7,7 @@ environment variables override it:
     job_uv_cache = "~/data/.cache/gpu_runner/uv"    # UV_CACHE_DIR for jobs
     job_cache = "~/data/.cache/gpu_runner"          # XDG_CACHE_HOME for jobs
     port = 18861                                    # rpyc port (localhost only)
+    sandbox = "plain"                               # job runner: "plain", or "bwrap" (bubblewrap)
 """
 import os
 
@@ -24,3 +25,4 @@ JOB_UV_CACHE = os.path.expanduser(setting(CONFIG, "job_uv_cache", "~/data/.cache
 JOB_CACHE = os.path.expanduser(setting(CONFIG, "job_cache", "~/data/.cache/gpu_runner"))
 
 PORT = int(setting(CONFIG, "port", 18861))
+SANDBOX = setting(CONFIG, "sandbox", "plain")  # a key of runner.RUNNERS
