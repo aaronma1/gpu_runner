@@ -69,7 +69,7 @@ JOB_CACHE = os.path.expanduser(setting(CONFIG, "job_cache", "~/data/.cache/gpu_r
 
 PORT = int(setting(CONFIG, "port", 18861))
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
-MAX_DOWNLOAD_BYTES = 512  * 1024 * 1024 # 1 TB, arbitrary limit to avoid memory exhaustion
+MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024  # 512 MiB; downloads are built in memory, so cap them
 
 
 def job_env(gpus):
@@ -426,8 +426,8 @@ def main():
     parser_daemon = subparsers.add_parser("daemon", help="Start the GPU daemon.")
     parser_daemon.add_argument("--gpu", type=int, nargs="+", default=[0],
                                help="GPU indices every job gets (default: 0).")
-                            
-    parser_daemon.add_argument("--cpu", action="store_true", help="CPU indices every job gets (default: 0).")
+    parser_daemon.add_argument("--cpu", action="store_true",
+                               help="Run jobs with no GPUs (CUDA_VISIBLE_DEVICES empty); overrides --gpu.")
     parser_daemon.add_argument("--workdir", default=DAEMON_WORKDIR)
     parser_daemon.add_argument("--verbose", action="store_true", help="Print verbose output.")
 
@@ -471,11 +471,11 @@ def main():
         threading.Thread(target=server.start, daemon=True).start()
         print(f"GPU daemon on localhost:{PORT}, gpus={[] if args.cpu else args.gpu}, workdir={args.workdir}", flush=True)
         try:
-            daemon._loop()
-        except:
+            daemon._loop()  # only returns by raising; anything but Ctrl-C prints its traceback
+        except KeyboardInterrupt:
             print("GPU daemon exiting.", flush=True)
+        finally:
             server.close()
-            sys.exit(1)
 
     elif args.command == "submit":
         job_uuid = submit_job(args.tarfile, args.commands, args.message_id or str(uuid.uuid4()))
