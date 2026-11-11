@@ -24,37 +24,21 @@ on localhost): the installed gpu_runner command, else this checkout and its .ven
     python = "/home/me/Projects/gpu_runner/.venv/bin/python"     # env that has rpyc; "" runs
                                                                  # gpurun directly
 """
-import io
 import os
 import shlex
 import shutil
 import subprocess
-import sys
 import tarfile
 import tempfile
 import time
-import tomllib
 import uuid
 
 from mcp.server.mcpserver import MCPServer
 
-
-def load_config():
-    """The [mcp] table of $GPURUN_CONFIG_DIR/config.toml (default ~/.config/gpu_runner);
-    {} if the file doesn't exist."""
-    config_dir = os.path.expanduser(os.environ.get("GPURUN_CONFIG_DIR", "~/.config/gpu_runner"))
-    path = os.path.join(config_dir, "config.toml")
-    try:
-        with open(path, "rb") as f:
-            return tomllib.load(f).get("mcp", {})
-    except FileNotFoundError:
-        return {}
-    except tomllib.TOMLDecodeError as e:
-        sys.exit(f"gpu_runner_mcp: bad config file {path}: {e}")
-
+from gpu_runner_utils import TERMINAL, load_config, safe_extract, tar_gz
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG = load_config()
+CONFIG = load_config("mcp", "gpu_runner_mcp")
 INSTALLED = shutil.which("gpu_runner")  # from `make install`; runs on its own venv
 # local only: a remote daemon is always reached as `ssh HOST .local/bin/gpu_runner ...`
 GPURUN = CONFIG.get("gpurun", INSTALLED or os.path.join(HERE, "gpu_runner.py"))
@@ -67,7 +51,6 @@ REMOTE_GPURUN = ".local/bin/gpu_runner"
 DAEMON_WORKDIR = CONFIG.get("daemon_workdir", "~/data/.gpu_runner" if SSH_HOST
                             else os.path.expanduser("~/data/.gpu_runner"))
 
-TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 EXCLUDE_DIRS = {".git", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
                 ".ipynb_checkpoints", "node_modules", "wandb"}
 MAX_UPLOAD_MB = 500
@@ -107,10 +90,7 @@ def tar_dir(path):
         parts = ti.name.split("/")
         return None if any(p in EXCLUDE_DIRS for p in parts) or ti.name.endswith((".pyc", ".pyo")) else ti
 
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        tf.add(path, arcname=".", filter=skip)
-    data = buf.getvalue()
+    data = tar_gz([(path, ".")], filter=skip)
     if len(data) > MAX_UPLOAD_MB * 2**20:
         raise RunnerError(f"upload is {len(data) / 2**20:.0f} MB (> {MAX_UPLOAD_MB} MB); "
                           "download datasets inside the job instead of uploading them")
@@ -150,24 +130,6 @@ def tail(text, lines):
     parts = text.splitlines(keepends=True)
     cut = len(parts) - lines
     return (f"[... {cut} earlier lines omitted ...]\n" if cut > 0 else "") + "".join(parts[-lines:])
-
-
-def _safe_extract(data, dest):
-    """Extract a tar.gz built from a job's directory (untrusted names) into dest."""
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-        if hasattr(tarfile, "data_filter"):
-            tar.extractall(dest, filter="data")
-            return
-        root = os.path.realpath(dest)
-        members = []
-        for m in tar.getmembers():
-            target = os.path.realpath(os.path.join(dest, m.name))
-            if target != root and not target.startswith(root + os.sep):
-                raise RunnerError(f"unsafe path in download: {m.name}")
-            if m.issym() or m.islnk() or m.isdev():
-                continue
-            members.append(m)
-        tar.extractall(dest, members=members)
 
 
 def _place(src, dest, job_path, overwrite):
@@ -385,7 +347,7 @@ def download_job_files(job_uuid: str, files: dict[str, str], overwrite: bool = T
         status = get_status(job_uuid)
         placed = {}
         with tempfile.TemporaryDirectory(prefix="gpu_runner_dl_") as tmp:
-            _safe_extract(data, tmp)
+            safe_extract(data, tmp)
             for job_path, dest in targets.items():
                 src = os.path.join(tmp, os.path.normpath(job_path))
                 if not os.path.lexists(src):

@@ -15,7 +15,8 @@ make install        # ~/.local/bin/gpu_runner, on its own venv in ~/.local/share
 gpu_runner daemon --gpu 0 1
 ```
 
-`make install` copies `gpu_runner.py`, so re-run it after changing that file. `make uninstall`
+`make install` copies `gpu_runner.py` and `gpu_runner_utils.py` into `~/.local/share/gpu_runner`
+(linked from `~/.local/bin/gpu_runner`), so re-run it after changing either file. `make uninstall`
 removes the command and its venv. Set `PREFIX`, `BINDIR` or `LIBDIR` to install elsewhere.
 
 On the machine where Claude Code runs (this can be the same machine):

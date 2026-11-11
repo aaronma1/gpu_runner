@@ -226,6 +226,26 @@ class TestLifecycle:
         assert seen[-2:] == ["RUNNING", "COMPLETED"]
         assert set(seen) <= {"QUEUED", "RUNNING", "COMPLETED"}
 
+    def test_transition_table(self):
+        job = gpu_runner.Job("j", None, ["true"], "/nonexistent")
+        with pytest.raises(RuntimeError, match="QUEUED -> COMPLETED"):
+            job.transition("COMPLETED")  # must start running first
+        job.transition("RUNNING")
+        assert job.started and not job.finished.is_set()
+        with pytest.raises(RuntimeError):
+            job.transition("QUEUED")
+        job.transition("FAILED")
+        assert job.ended and job.finished.is_set()
+        for state in ("QUEUED", "RUNNING", "COMPLETED", "CANCELLED"):
+            with pytest.raises(RuntimeError):
+                job.transition(state)  # terminal states are final
+        assert job.status == "FAILED"
+
+    def test_queued_can_be_cancelled_directly(self):
+        job = gpu_runner.Job("j", b"tar", ["true"], "/nonexistent")
+        job.transition("CANCELLED")
+        assert job.started is None and job.ended and job.tarfile is None and job.finished.is_set()
+
     def test_timestamps_recorded(self, daemon):
         jid = daemon.submit(["true"])
         daemon.wait(jid)
@@ -337,8 +357,20 @@ class TestExecution:
         tag = f"leftover-{uuid.uuid4().hex[:8]}"
         jid = daemon.submit([f"(bash -c 'exec -a {tag} sleep 60' &) ; echo spawned"])
         daemon.wait(jid, timeout=25)
-        time.sleep(0.5)
+        # no grace period: a terminal status must mean the job's processes are already dead
         assert pids_alive(tag) == [], "a background process outlived its job (it could hold a GPU)"
+
+    def test_next_job_starts_only_after_leftovers_dead(self, daemon):
+        # The leftover ignores SIGTERM, so cleanup takes the slow SIGKILL path (~2 s). The job must
+        # not look finished, nor the next job start, until it's dead: it could be holding a GPU.
+        tag = f"stubborn-{uuid.uuid4().hex[:8]}"
+        half = len(tag) // 2  # split in the check so its own shell's cmdline doesn't match
+        a = daemon.submit([f"(bash -c \"trap '' TERM; exec -a {tag} sleep 60\" &) ; sleep 0.3"])
+        b = daemon.submit([f"! pgrep -f '{tag[:half]}''{tag[half:]}'"])
+        assert daemon.wait(a, timeout=25)[0] == "COMPLETED"
+        assert pids_alive(tag) == [], "job A finished while its leftover was still alive"
+        assert daemon.wait(b, timeout=25)[0] == "COMPLETED", "job B started while A's leftover was alive"
+        assert daemon.jobs[b].started >= daemon.jobs[a].ended
 
 
 # ====================================================================== Daemon: cancel
@@ -1222,7 +1254,7 @@ class TestMCPDownload:
     def test_safe_extract_rejects_traversal(self, mcp_mod, tmp_path):
         evil = make_tar({"../evil.txt": "x"})
         with pytest.raises(Exception):
-            mcp_mod._safe_extract(evil, str(tmp_path / "x"))
+            mcp_mod.safe_extract(evil, str(tmp_path / "x"))
         assert not (tmp_path / "evil.txt").exists()
 
     def test_call_through_mcp_protocol(self, mcp_mod, mcp_job, tmp_path):

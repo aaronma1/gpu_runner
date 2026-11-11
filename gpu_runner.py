@@ -30,45 +30,30 @@ Settings are read at startup from the [runner] table of $GPURUN_CONFIG_DIR/confi
     port = 18861                                    # rpyc port (localhost only)
 """
 import argparse
-import io
 import os
 import signal
 import subprocess
 import sys
-import tarfile
 import threading
 import time
-import tomllib
 import uuid
 
 import rpyc
 
-
-def load_config():
-    """The [runner] table of $GPURUN_CONFIG_DIR/config.toml (default ~/.config/gpu_runner);
-    {} if the file doesn't exist. GPU_RUNNER_* environment variables override its values."""
-    config_dir = os.path.expanduser(os.environ.get("GPURUN_CONFIG_DIR", "~/.config/gpu_runner"))
-    path = os.path.join(config_dir, "config.toml")
-    try:
-        with open(path, "rb") as f:
-            return tomllib.load(f).get("runner", {})
-    except FileNotFoundError:
-        return {}
-    except tomllib.TOMLDecodeError as e:
-        sys.exit(f"gpu_runner: bad config file {path}: {e}")
+from gpu_runner_utils import TERMINAL, is_within, load_config, safe_extract, tar_gz
 
 
 def setting(config, key, default):
+    """GPU_RUNNER_<KEY> from the environment, else the config value, else `default`."""
     return os.environ.get(f"GPU_RUNNER_{key.upper()}", config.get(key, default))
 
 
-CONFIG = load_config()
+CONFIG = load_config("runner", "gpu_runner")
 DAEMON_WORKDIR = os.path.expanduser(setting(CONFIG, "workdir", "~/data/.gpu_runner"))
 JOB_UV_CACHE = os.path.expanduser(setting(CONFIG, "job_uv_cache", "~/data/.cache/gpu_runner/uv"))
 JOB_CACHE = os.path.expanduser(setting(CONFIG, "job_cache", "~/data/.cache/gpu_runner"))
 
 PORT = int(setting(CONFIG, "port", 18861))
-TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024  # 512 MiB; downloads are built in memory, so cap them
 
 
@@ -118,64 +103,55 @@ class Daemon(rpyc.Service):
             print(f"[gpu_runner] setting up job {job.job_uuid} in {job.workdir}", flush=True)
         os.makedirs(job.workdir)
         if job.tarfile:
-            with tarfile.open(fileobj=io.BytesIO(job.tarfile), mode="r:*") as tar:
-                if hasattr(tarfile, "data_filter"):
-                    tar.extractall(job.workdir, filter="data")  # rejects ../ and absolute paths
-                else:
-                    root = os.path.realpath(job.workdir)
-                    for m in tar.getmembers():
-                        target = os.path.realpath(os.path.join(job.workdir, m.name))
-                        if target != root and not target.startswith(root + os.sep):
-                            raise ValueError(f"unsafe path in tarball: {m.name}")
-                    tar.extractall(job.workdir)
+            safe_extract(job.tarfile, job.workdir)
         job.tarfile = None  # free the upload's memory
 
     def _run_job(self, job):
-        """Runs in its own thread. Never raises: any error marks the job FAILED, so the
-        daemon can always move on to the next job."""
+        """Runs a RUNNING job in its own thread and always moves it to a terminal state. Never
+        raises, so the daemon can always move on to the next job.
+
+        The terminal state is entered only after the job's leftover processes are dead, so a
+        terminal status means the GPUs are free: _loop starts the next job on it."""
+        outcome, failed_command = "FAILED", None
         try:
             self._setup_job(job)
-            env = job_env(self.gpus)
-            for command in job.commands:
-                # Output goes to files, not pipes: with pipes, a background child that inherits
-                # them keeps the job "running" until it exits. stdin is /dev/null so a command
-                # that reads input gets EOF instead of blocking on the daemon's stdin.
-                # Spawned under the job's mutex so a cancel either sees this process group or
-                # stops it from being started.
-                with job.mutex:
-                    if job.cancel_requested:
-                        job.status = "CANCELLED"
-                        return
-                    with open(job.stdout_path, "ab") as out, open(job.stderr_path, "ab") as err:
-                        process = subprocess.Popen(command, cwd=job.workdir, shell=True, env=env,
-                                                   stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                                   start_new_session=True)
-                    job.pid = process.pid
-                    job.pgids.append(process.pid)  # its own process group (new session)
-                process.wait()
-                with job.mutex:
-                    job.exit_code = process.returncode
-                if process.returncode != 0:
-                    with job.mutex:
-                        if job.cancel_requested:
-                            job.status = "CANCELLED"
-                        else:
-                            job.failed_command = command
-                            job.status = "FAILED"
-                    return
-            with job.mutex:
-                job.status = "COMPLETED"
+            outcome, failed_command = self._run_commands(job)
         except Exception as e:
             with open(job.stderr_path, "a") as err:
                 err.write(f"\n[gpu_runner] job setup/run error: {type(e).__name__}: {e}\n")
-            with job.mutex:
-                job.status = "FAILED"
         finally:
-            self._kill_leftovers(job)
+            try:
+                self._kill_leftovers(job)
+            finally:
+                with job.mutex:
+                    job.failed_command = failed_command
+                    job.transition(outcome)
+
+    def _run_commands(self, job):
+        """Run the job's commands in order; returns (outcome, failed_command) where outcome is
+        the terminal state the job should end in. Updates exit_code/pid/pgids as it goes."""
+        env = job_env(self.gpus)
+        for command in job.commands:
+            # Output goes to files, not pipes: with pipes, a background child that inherits
+            # them keeps the job "running" until it exits. stdin is /dev/null so a command
+            # that reads input gets EOF instead of blocking on the daemon's stdin.
+            # Spawned under the job's mutex so a cancel either sees this process group or
+            # stops it from being started.
             with job.mutex:
-                job.pid = None
-                job.ended = time.time()
-            job.finished.set()
+                if job.cancel_requested:
+                    return "CANCELLED", None
+                with open(job.stdout_path, "ab") as out, open(job.stderr_path, "ab") as err:
+                    process = subprocess.Popen(command, cwd=job.workdir, shell=True, env=env,
+                                               stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                               start_new_session=True)
+                job.pid = process.pid
+                job.pgids.append(process.pid)  # its own process group (new session)
+            process.wait()
+            with job.mutex:
+                job.exit_code = process.returncode
+                if process.returncode != 0:
+                    return ("CANCELLED", None) if job.cancel_requested else ("FAILED", command)
+        return "COMPLETED", None
 
     @staticmethod
     def _kill_leftovers(job):
@@ -206,8 +182,7 @@ class Daemon(rpyc.Service):
                 if self.running is None and self.ready:
                     job = self.ready.pop(0)
                     with job.mutex:
-                        job.status = "RUNNING"
-                        job.started = time.time()
+                        job.transition("RUNNING")
                     self.running = job
                     print(f"Job {job.job_uuid} started.", flush=True)
                     threading.Thread(target=self._run_job, args=(job,), daemon=True).start()
@@ -275,7 +250,7 @@ class Daemon(rpyc.Service):
             if os.path.isabs(f) or arc == ".." or arc.startswith(".." + os.sep):
                 raise ValueError(f"{f!r} is not a path inside the job directory")
             real = os.path.realpath(os.path.join(root, arc))  # follows symlinks
-            if real != root and not real.startswith(root + os.sep):
+            if not is_within(real, root):
                 raise ValueError(f"{f!r} resolves outside the job directory")
             if os.path.exists(real):
                 entries.append((real, arc))
@@ -295,16 +270,12 @@ class Daemon(rpyc.Service):
             # client's extraction, so leave it out.
             if ti.issym() or ti.islnk():
                 target = os.path.realpath(os.path.join(root, os.path.dirname(ti.name), ti.linkname))
-                if target != root and not target.startswith(root + os.sep):
+                if not is_within(target, root):
                     return None
             return ti
 
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            for real, arc in entries:
-                # arcnames are relative to root, so the filter can resolve links against it
-                tar.add(real, arcname=arc, filter=drop_escaping_links)
-        return buf.getvalue()  # bytes: passed by value
+        # arcnames are relative to root, so the filter can resolve links against it
+        return tar_gz(entries, filter=drop_escaping_links)  # bytes: passed by value
 
     def exposed_cancel_job(self, job_uuid, timeout=30):
         """Cancel a job; returns (status, exit_code, failed_command) like get_job_status.
@@ -315,16 +286,14 @@ class Daemon(rpyc.Service):
         job = self._job(job_uuid)
         with self.mutex:  # same lock order as _loop: daemon, then job
             with job.mutex:
+                running = job.status == "RUNNING"
                 if job.status == "QUEUED":
                     self.ready.remove(job)
-                    job.status = "CANCELLED"
-                    job.ended = time.time()
-                    job.tarfile = None
-                    job.finished.set()
+                    job.transition("CANCELLED")
                     print(f"Job {job.job_uuid} CANCELLED (queued).", flush=True)
-                elif job.status == "RUNNING":
-                    job.cancel_requested = True
-        if job.cancel_requested:
+                elif running:
+                    job.cancel_requested = True  # _run_commands turns this into CANCELLED
+        if running:
             self._kill_leftovers(job)  # no new groups can appear once cancel_requested is set
             job.finished.wait(timeout)
         with job.mutex:
@@ -365,6 +334,17 @@ def _read(path):
 
 
 class Job:
+    """A job and its lifecycle, a state machine changed only through transition():
+
+        QUEUED --> RUNNING --> COMPLETED | FAILED | CANCELLED
+           \\--> CANCELLED                (cancelled before it started)
+
+    Entered by: RUNNING from Daemon._loop; CANCELLED from QUEUED by cancel_job; the terminal
+    states from RUNNING by Daemon._run_job, after the job's processes are dead. A cancel of a
+    RUNNING job only sets cancel_requested; _run_job turns it into CANCELLED."""
+
+    TRANSITIONS = {"QUEUED": {"RUNNING", "CANCELLED"}, "RUNNING": TERMINAL}
+
     def __init__(self, job_uuid, tarfile, commands, workdir):
 
         # immutable attributes
@@ -375,16 +355,30 @@ class Job:
         self.stderr_path = workdir + ".stderr"
 
         self.mutex = threading.Lock()
-        self.tarfile = tarfile       # bytes; dropped after extraction (mutex protected)
-        self.status = "QUEUED"       # QUEUED -> RUNNING -> COMPLETED | FAILED | CANCELLED,
-                                     # or QUEUED -> CANCELLED (mutex protected)
-        self.pid = None              # mutex protected
-        self.exit_code = None        # mutex protected
-        self.failed_command = None   # mutex protected
+        self.status = "QUEUED"       # see TRANSITIONS; change only via transition() (mutex protected)
+        self.tarfile = tarfile       # bytes; dropped after extraction or on finishing (mutex protected)
+        self.pid = None              # current command's pid while RUNNING (mutex protected)
+        self.exit_code = None        # last command's exit code (mutex protected)
+        self.failed_command = None   # set on entering FAILED (mutex protected)
         self.pgids = []              # process groups of its commands (mutex protected)
-        self.cancel_requested = False  # set once by cancel_job (mutex protected)
-        self.finished = threading.Event()  # set when the job is over and its processes are dead
-        self.started = self.ended = None
+        self.cancel_requested = False  # set once by cancel_job while RUNNING (mutex protected)
+        self.finished = threading.Event()  # set on entering a terminal state
+        self.started = self.ended = None   # set on entering RUNNING / a terminal state
+
+    def transition(self, new):
+        """Move to state `new`; the caller holds self.mutex. Raises RuntimeError for a move
+        TRANSITIONS doesn't allow. Entering a terminal state records the end, drops the upload
+        and wakes finished.wait()ers; callers must have killed the job's processes first."""
+        if new not in self.TRANSITIONS.get(self.status, ()):
+            raise RuntimeError(f"job {self.job_uuid}: illegal transition {self.status} -> {new}")
+        self.status = new
+        if new == "RUNNING":
+            self.started = time.time()
+        else:
+            self.ended = time.time()
+            self.tarfile = None
+            self.pid = None
+            self.finished.set()
 
 
 # ------------------------------------------------------------ client
